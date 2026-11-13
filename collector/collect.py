@@ -193,6 +193,26 @@ def clean_validators(network):
     }
 
 
+CHAIN_FIELDS = (
+    "state", "reason", "rule_version", "network_id", "registry_domain",
+    "start_day", "start_date", "start_time", "head", "finalized",
+    "slot_ms", "epoch_slots", "final_after_ms", "currency", "switch", "rules", "fees",
+)
+
+
+def clean_chain(chain, now):
+    """The 6529 chain (rc.16+) as this node sees it: public chain facts only.
+
+    Drops what describes this machine rather than the chain: whether it proposes
+    blocks and why not, its catch-up progress and its local record count.
+    """
+    if not isinstance(chain, dict) or "state" not in chain:
+        return None
+    c = pick(chain, CHAIN_FIELDS)
+    c["generated_unix"] = now
+    return c
+
+
 def summary(c):
     cert = c.get("certificate") or {}
     hdr = c.get("header") or {}
@@ -298,11 +318,20 @@ def main():
         "next_accounts": network.get("next_accounts"),
     })
 
+    # The 6529 chain (rc.16+). Optional: older nodes have no /chain.
+    try:
+        chain = clean_chain(get(a.api, "chain"), int(time.time()))
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        chain = None
+    if chain:
+        write_json(os.path.join(out, "chain.json"), chain)
+
     vals = clean_validators(network)
     if vals:
         write_json(os.path.join(out, "validators.json"), vals)
-    print("ok: %d cycles, latest certified %s, %s validator accounts" % (
-        len(index), network.get("latest_certified_day"), len(vals["accounts"]) if vals else 0))
+    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s" % (
+        len(index), network.get("latest_certified_day"), len(vals["accounts"]) if vals else 0,
+        "%s at height %s" % (chain.get("state"), (chain.get("head") or {}).get("height")) if chain else "-"))
     return 0
 
 

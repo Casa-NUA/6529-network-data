@@ -24,9 +24,10 @@ git clean -fdq -- docs/data
 /usr/bin/python3 collector/collect.py --out docs/data
 
 git add docs/data
-# network.json carries the collection time, so it changes on every run. Commit only
-# when something else changed, or once an hour so the data's freshness stays visible.
-if git diff --cached --quiet -- docs/data ':!docs/data/network.json'; then
+# network.json and chain.json carry the collection time and the chain's head, so they
+# change on every run. Commit only when something else changed, or once an hour so the
+# data's freshness stays visible.
+if git diff --cached --quiet -- docs/data ':!docs/data/network.json' ':!docs/data/chain.json'; then
   last=$(git log -1 --format=%ct -- docs/data/network.json 2>/dev/null || echo 0)
   if [ $(( $(date +%s) - ${last:-0} )) -lt 3600 ]; then
     git reset --quiet --hard origin/main
