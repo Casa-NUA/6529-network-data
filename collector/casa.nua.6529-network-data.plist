@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Install: replace every /ABSOLUTE/PATH/TO/CLONE with the clone's absolute path
+     (launchd expands neither ~ nor variables), keep the clone outside Documents,
+     Desktop and Downloads, copy to ~/Library/LaunchAgents/ and
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/casa.nua.6529-network-data.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>casa.nua.6529-network-data</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/ABSOLUTE/PATH/TO/CLONE/collector/publish.sh</string>
+    <string>/ABSOLUTE/PATH/TO/CLONE</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>GIT_TERMINAL_PROMPT</key><string>0</string>
+    <key>TZ</key><string>UTC</string>
+  </dict>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>
+</dict>
+</plist>
