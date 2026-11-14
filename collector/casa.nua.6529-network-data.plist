@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Install: replace every /ABSOLUTE/PATH/TO/CLONE with the clone's absolute path
-     (launchd expands neither ~ nor variables), keep the clone outside Documents,
-     Desktop and Downloads, copy to ~/Library/LaunchAgents/ and
+<!-- Install: copy collect.py, sign.py and publish.sh to a folder OUTSIDE the publishing
+     clone (e.g. ~/Library/Application Support/6529-network-data/). Replace
+     /ABSOLUTE/PATH/TO/COLLECTOR with that folder and /ABSOLUTE/PATH/TO/CLONE with the
+     clone's absolute path (launchd expands neither ~ nor variables), keep the clone
+     outside Documents, Desktop and Downloads, copy this file to ~/Library/LaunchAgents/ and
      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/casa.nua.6529-network-data.plist -->
 <plist version="1.0">
 <dict>
@@ -10,7 +12,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/ABSOLUTE/PATH/TO/CLONE/collector/publish.sh</string>
+    <string>/ABSOLUTE/PATH/TO/COLLECTOR/publish.sh</string>
     <string>/ABSOLUTE/PATH/TO/CLONE</string>
   </array>
   <key>EnvironmentVariables</key>
