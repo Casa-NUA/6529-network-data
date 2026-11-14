@@ -461,6 +461,7 @@ def main():
     cycles_dir = os.path.join(out, "cycles")
     os.makedirs(cycles_dir, exist_ok=True)
 
+    wrote_today_cycle = False
     days = set()
     for name in os.listdir(cycles_dir):
         if name.endswith(".json") and name[:-5].isdigit():
@@ -478,6 +479,8 @@ def main():
             continue  # nothing public to show yet (or not the day that was asked for)
         write_json(os.path.join(cycles_dir, "%d.json" % day), c)
         days.add(day)
+        if day == today:
+            wrote_today_cycle = True
 
     index = []
     for day in sorted(days, reverse=True):
@@ -503,7 +506,31 @@ def main():
         "next_keys": network.get("next_keys"),
         "next_accounts": network.get("next_accounts"),
     }, NETWORK, "network")
-    net["generated_unix"] = int(time.time())
+    # network.json is written fresh on every run even when another file could not be:
+    # a restarting node reports no members, and a cycle fetch can fail. So it also says
+    # when validators.json and today's cycle file were last written, and a reader can
+    # tell fresh data from a fresh network.json sitting next to an old file.
+    now = int(time.time())
+    vals = clean_validators(network)
+    if vals:
+        write_json(os.path.join(out, "validators.json"), vals)
+    previous = {}
+    try:
+        with open(os.path.join(out, "network.json")) as f:
+            previous = json.load(f)
+        if not isinstance(previous, dict):
+            previous = {}
+    except (OSError, ValueError, RecursionError):
+        previous = {}
+
+    def age(key, written):
+        old = clean(previous.get(key), INT)
+        return now if written else (None if old is _BAD else old)
+    net["generated_unix"] = now
+    net["validators_unix"] = age("validators_unix", bool(vals))
+    # Only meaningful for the day it was written for: a new day starts without a file.
+    net["cycle_unix"] = age("cycle_unix", wrote_today_cycle) \
+        if (wrote_today_cycle or previous.get("today") == today) else None
     write_json(os.path.join(out, "network.json"), net)
 
     # The 6529 chain (rc.16+). Optional: older nodes have no /chain.
@@ -514,9 +541,6 @@ def main():
     if chain:
         write_json(os.path.join(out, "chain.json"), chain)
 
-    vals = clean_validators(network)
-    if vals:
-        write_json(os.path.join(out, "validators.json"), vals)
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):
         print("not published: %s" % what, file=sys.stderr)
     print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s" % (

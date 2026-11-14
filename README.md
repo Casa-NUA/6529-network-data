@@ -31,7 +31,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 
 | File | What it is |
 |---|---|
-| `docs/data/network.json` | `generated_unix` (collection time), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
+| `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
 | `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
 | `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run, published at least hourly. |
 | `docs/data/cycles/<day>.json` | One cycle (day number = days since 1970-01-01 UTC): `state`, `window`, `header`, `cycle_root`, `history_root`, `history_count`, `certificate` (summary: level, weights, counts, roots), `compare`, `dual_run`, `other_roots` (a count), `finalized_unix`. |
@@ -43,7 +43,8 @@ Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/doc
 Timing: the collector runs every 10 minutes. A commit is made when something other
 than the collection time changed, and at least once an hour, so a file here can be up
 to about an hour behind the node, plus a few minutes of GitHub caching. If the node or
-the collector stops, the last files stay as they are: check `generated_unix`.
+the collector stops, the last files stay as they are: check `generated_unix`, and
+`validators_unix` / `cycle_unix` for the age of those two files.
 
 ## Personal data
 
