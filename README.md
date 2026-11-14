@@ -1,6 +1,6 @@
 # 6529 network data
 
-Public data about the 6529 validator network, collected about every 10 minutes from
+Public data about the 6529 validator network, collected about every 5 minutes from
 one 6529 Validator node run by Casa NUA and published here as JSON. The mobile app
 6529 Validator Monitor reads these files.
 
@@ -40,9 +40,17 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 
 Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/docs/data/<file>`
 
-Timing: the collector runs every 10 minutes. A commit is made when something other
-than the collection time changed, and at least once an hour, so a file here can be up
-to about an hour behind the node, plus a few minutes of GitHub caching. If the node or
+Timing: the collector runs every 5 minutes. A commit is made when something other
+than the collection time changed, and at least once an hour, so when nothing is
+changing a file here can be up to about an hour old.
+
+Why not more often than 5 minutes: GitHub serves these raw files through a cache that
+keeps each file for 5 minutes (`cache-control: max-age=300`). A reader can therefore be
+handed a copy up to 5 minutes old whatever the collector does. Running the collector
+more often would shave little off the delay, because the cache dominates, while adding
+commits. A change in the network usually reaches a reader within about 10 minutes (up
+to 5 for the collector's next run and up to 5 for the cache), and sometimes a little
+more, since the cache can hand out a copy that was already a few minutes old. If the node or
 the collector stops, the last files stay as they are: check `generated_unix`, and
 `validators_unix` / `cycle_unix` for the age of those two files.
 

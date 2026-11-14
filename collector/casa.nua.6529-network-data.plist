@@ -21,7 +21,9 @@
     <key>GIT_TERMINAL_PROMPT</key><string>0</string>
     <key>TZ</key><string>UTC</string>
   </dict>
-  <key>StartInterval</key><integer>600</integer>
+  <!-- Every 5 minutes. Not less: GitHub's raw file cache keeps each file for 5 minutes,
+       so a shorter interval would not make the data anyone reads any fresher. -->
+  <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>
   <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>

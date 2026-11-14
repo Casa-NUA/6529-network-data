@@ -1,6 +1,6 @@
 #!/bin/bash
 # Collect public network data from the local validator and push it when it changed.
-# Usage: publish.sh /path/to/the-publishing-clone   (run every 10 minutes by launchd)
+# Usage: publish.sh /path/to/the-publishing-clone   (run every 5 minutes by launchd)
 #
 # INSTALL THIS FOLDER OUTSIDE THE CLONE. This script, collect.py and sign.py must run
 # from a fixed copy (for example ~/Library/Application Support/6529-network-data/),
