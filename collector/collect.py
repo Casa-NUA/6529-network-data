@@ -284,6 +284,8 @@ REPORT = {
 MACHINE = {
     "code": RE(r"^[0-9a-f]{8}$"), "weight": INT, "today": STR, "first_signed_day": INT,
     "last_signed_day": INT, "signed_7": INT, "signed_30": INT,
+    # When this machine signed today's result (unix seconds; null until it has). rc.17+.
+    "signed_unix": INT,
 }
 WALLET = RE(r"^0x[0-9a-fA-F]{40}$")
 NEXT_MEMBER = {"wallet": WALLET, "keys": INT, "tdh": INT}
