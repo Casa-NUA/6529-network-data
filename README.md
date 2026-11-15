@@ -11,7 +11,8 @@ one 6529 Validator node run by Casa NUA and published here as JSON. The mobile a
 - Most values are things every validator node receives from the network: cycle
   headers, roots, certificate summaries, the validator list. A few are this node's
   **own observations** and will differ slightly between nodes: `strong_unix`,
-  `finalized_unix`, `compare`, `dual_run`, and everything in `chain.json`.
+  `finalized_unix`, `compare`, `dual_run`, and everything in `chain.json` and
+  `blocks.json`.
 - The files do not include the validators' own signatures, so a certificate cannot be
   verified from this data alone. To check it, compare with your own node (below).
 - The collector publishes only what a strict schema in `collector/collect.py` allows.
@@ -34,6 +35,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 | `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
 | `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
 | `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run, published at least every 15 minutes. |
+| `docs/data/blocks.json` | Who made (proposed) the 6529 chain's blocks, on the collecting node's current chain, for up to 7 chain days: `day` (the UTC day of the head block), `head_height`, `days` (day numbers, oldest first; a day starts at `day * 86400` UTC), `totals` (blocks per day, all makers) and `accounts`: per wallet, `counts` (its blocks per day, same order), `today_unix` (the slot time of each block it made today) and `last_unix` (the slot time of its latest block in those days). Only accounts that made a block in those days are listed; a maker that is not a validating account today is counted in `totals` but not listed. Counts are blocks proposed, not votes, and include blocks not yet final, so a count can drop after a reorganisation. Read from the node's chain store (see "Run it yourself"). |
 | `docs/data/cycles/<day>.json` | One cycle (day number = days since 1970-01-01 UTC): `state`, `window`, `header`, `cycle_root`, `history_root`, `history_count`, `certificate` (summary: level, weights, counts, roots), `compare`, `dual_run`, `other_roots` (a count), `finalized_unix`. |
 | `docs/data/cycles/index.json` | One summary line per cycle. |
 | `docs/data/signed/<same names>` | The same files, each wrapped with a signature (see "Signatures"). |
@@ -61,7 +63,9 @@ signing status, software version and, only where the operator chose to declare i
 continent, a country and whether the machine is at home or in a rack. Nobody verifies
 those declarations. Because this is a git repository, every past publication stays in
 its history: an operator who later removes a declared location cannot remove it from
-past snapshots here. State and metro, which the network also carries, are not
+past snapshots here. `blocks.json` adds, for each wallet, how many blocks it made on
+the 6529 chain and when: public facts of that chain, which also show when an
+operator's validator was running. State and metro, which the network also carries, are not
 published here. There are no names, handles or IP addresses.
 
 ## Signatures
@@ -133,7 +137,13 @@ collection times.
 The collector finds the node's loopback API by itself on macOS (desktop app or
 service install). Elsewhere, or if it finds nothing, pass it:
 `--api http://127.0.0.1:<port>/api/v1`. It uses only the Python standard library and
-reads only the node's loopback API (`status`, `network`, `cycles/<day>`, `chain`).
+reads the node's loopback API (`status`, `network`, `cycles/<day>`, `chain`). For
+`blocks.json` it also reads one file of the node's chain store on disk, the index of
+blocks (`chain/<id>/index/blocks.log`: public chain facts), and the node's own block
+count from the API (`chain/me`, `awards`, `awards/days`), which it uses only to check
+that it read that file right and never publishes as such. The index's format is not
+documented by 6529 and may change with a release: when the check fails, `blocks.json`
+is simply not refreshed, and its `generated_unix` shows its age.
 
 Another independent collector of the same network data is
 [6529scan](https://github.com/nothingbugger/6529scan); its cycle roots can be compared

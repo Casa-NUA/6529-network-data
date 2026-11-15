@@ -9,22 +9,27 @@ whatever user runs it (the desktop app runs it as the logged-in user), checks th
 port really is the validator, and publishes only continent and country from each
 machine's self-reported location (not state or metro).
 
-Runs next to the node and reads only its loopback API.
+Runs next to the node and reads its loopback API. For blocks.json it also reads one
+file of the node's chain store on disk (the index of blocks: public chain facts) and
+the node's own block count from the API, used only to check that file was read right
+(see "Blocks per account" below).
 Writes only what a strict schema allows (see "What may be published" below): cycle
 headers, roots, certificate summaries and verification outcomes, the validator list
 and public chain facts. It does not write this node's keys, peers, servers or
 location, and it leaves out the certificate lists from which the node's own account
 could be worked out. Some values are this node's own observations rather than
-network facts (strong_unix, finalized_unix, compare, dual_run, chain.json).
+network facts (strong_unix, finalized_unix, compare, dual_run, chain.json, blocks.json).
 
 Python 3.9+, standard library only.
 
     python3 collect.py --out /path/to/site/data [--api http://127.0.0.1:6529/api/v1]
 """
 import argparse
+import glob
 import http.client
 import json
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -432,6 +437,173 @@ def write_json(path, obj):
     os.chmod(path, 0o644)
 
 
+# ---- Blocks per account (from the node's own chain store) --------------------------
+# The node's API says who made (proposed) a block only for its own account. Its chain
+# store on disk records it for every block, in index/blocks.log. That file's format is
+# NOT documented and may change with any release, so nothing read from it is published
+# unless it passes two checks:
+#   1. public facts: the newest block read must be the API's head (same slot and time),
+#      and every block's day and time must follow from its slot;
+#   2. a self-check: the number of blocks the store gives this node's own account must
+#      equal the number the node's API reports for that account, for today and for
+#      each earlier day the API has a figure for.
+# The own account is used for that comparison only, and the comparison is made at the
+# same block height on both sides, so whether a run is skipped never depends on who
+# made a block. The published file lists every account the same way.
+#
+# A record, as read from rc.17:  u32 length, body, 8 bytes (a check value, not verified
+# here). Body: 2 bytes form (01 01), block root (32), parent root (32), slot (u64),
+# height (u64), day (u32), time in ms (u64), the maker's key id (32), 12 zero bytes and
+# the maker's wallet (20), then fields this collector does not read. Big-endian.
+BLOCKS_FORM = b"\x01\x01"
+BLOCK_FIXED = 2 + 32 + 32 + 8 + 8 + 4 + 8 + 32 + 32
+BLOCK_DAYS = 7                         # days published, today included
+STORE_DIRS = (
+    "~/Library/Application Support/6529-validator",       # the desktop app, macOS
+    "/var/lib/6529-validator",                             # the Linux service
+)
+
+
+def read_block_index(path, from_day):
+    """{root: (parent, slot, height, day, time_ms, wallet)} for blocks of `from_day` on.
+
+    Read as a stream, so the file's size does not matter. None if it is not the format
+    this was written for.
+    """
+    recs = {}
+    try:
+        if os.path.islink(path):
+            return None
+        with open(path, "rb") as f:
+            while True:
+                head = f.read(4)
+                if len(head) < 4:
+                    break
+                n = struct.unpack(">I", head)[0]
+                if n < BLOCK_FIXED or n > 16 * 1024 * 1024:
+                    return None
+                r = f.read(BLOCK_FIXED)
+                if len(r) < BLOCK_FIXED:
+                    break              # the node is appending: the last record is not whole yet
+                f.seek(n - BLOCK_FIXED + 8, 1)
+                if r[:2] != BLOCKS_FORM or r[126:138] != b"\0" * 12:
+                    return None
+                slot, height = struct.unpack(">QQ", r[66:82])
+                day = struct.unpack(">I", r[82:86])[0]
+                t = struct.unpack(">Q", r[86:94])[0]
+                if day != t // 86400000:
+                    return None
+                if day >= from_day:
+                    recs[r[2:34]] = (r[34:66], slot, height, day, t, "0x" + r[138:158].hex())
+    except OSError:
+        return None
+    return recs or None
+
+
+def chain_blocks(api, roster_wallets, now):
+    """Blocks each account made over the last days, or None (and why on stderr)."""
+    def no(why):
+        print("blocks.json not written: %s" % why, file=sys.stderr)
+        return None
+    # The head and the node's own figures must describe the same block height. A block
+    # can land between the two requests, so ask again a few times; if they still
+    # differ, skip this run, whoever made that block.
+    for _ in range(4):
+        try:
+            chain = get(api, "chain")
+            me = get(api, "chain/me")
+            settled = get(api, "awards/days")
+            awards = get(api, "awards")
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+            return no("the node's chain figures could not be read")
+        try:
+            head = chain["head"]
+            root, height, hslot, htime = head["root"], head["height"], head["slot"], head["time"]
+            start, slot_ms = chain["start_time"], chain["slot_ms"]
+            own, today_own, as_of = me["wallet"].lower(), awards["today"], awards["as_of"]["height"]
+            own_days = {d["day"]: d["blocks"] for d in settled["days"]}
+        except (KeyError, TypeError, AttributeError):
+            return no("the node's chain figures have an unexpected shape")
+        if as_of == height:
+            break
+    else:
+        return no("the head moved between requests every time (will try next run)")
+    if clean(root, HEX) is _BAD or clean(own, WALLET) is _BAD or len(root) != 66 \
+            or not all(isinstance(v, int) and not isinstance(v, bool) and v > 0
+                       for v in (height, hslot, htime, start, slot_ms)):
+        return no("the node's chain figures have an unexpected shape")
+    day = htime // 86400000
+    if today_own.get("day") != day:
+        return no("the node's own figures are for another day (a new day is starting)")
+    if not (now - 3 * 86400) * 1000 < htime <= (now + 600) * 1000:
+        return no("the head block's time is out of range")
+
+    paths = []
+    for d in STORE_DIRS:
+        paths += glob.glob(os.path.join(os.path.expanduser(d), "chain", "*", "index", "blocks.log"))
+    paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    canon, cur = None, bytes.fromhex(root[2:])
+    for p in paths[:4]:
+        recs = read_block_index(p, day - BLOCK_DAYS)
+        if not recs or cur not in recs:
+            continue
+        canon, c = [], cur
+        while c in recs and len(canon) <= len(recs):
+            canon.append(recs[c])
+            c = recs[c][0]
+        break
+    if canon is None:
+        return no("no chain store in the expected format holds the head block")
+    # Newest first. Public-fact checks: the head is the API's head, heights step down
+    # by one, and each block's time follows from its slot.
+    if canon[0][1:5] != (hslot, height, day, htime):
+        return no("the store's head block is not the API's")
+    for i, c in enumerate(canon):
+        if c[4] != start + c[1] * slot_ms or (i and (canon[i - 1][2] != c[2] + 1 or canon[i - 1][1] <= c[1])):
+            return no("the store's blocks do not follow one another as a chain does")
+
+    def count(d):
+        out = {}
+        for c in canon:
+            if c[3] == d:
+                out[c[5]] = out.get(c[5], 0) + 1
+        return out
+    # Only days read from their first block: the oldest day in the walk may be cut.
+    first_whole = canon[-1][3] if canon[-1][2] == 1 else canon[-1][3] + 1
+    days = [d for d in range(day - BLOCK_DAYS + 1, day + 1) if d >= first_whole]
+    if day not in days:
+        return no("the store does not hold today from its first block")
+    per_day = {d: count(d) for d in days}
+
+    # Self-check, at the same height on both sides (see above).
+    if per_day[day].get(own, 0) != today_own.get("blocks"):
+        return no("SELF-CHECK FAILED for today: the store's format may have changed")
+    for d in days[:-1]:
+        if d in own_days and per_day[d].get(own, 0) != own_days[d]:
+            return no("SELF-CHECK FAILED for day %d: the store's format may have changed" % d)
+
+    last, times = {}, {}
+    for c in canon:                    # newest first: the first seen is the latest
+        if c[3] in per_day and c[5] not in last:
+            last[c[5]] = c[4] // 1000
+        if c[3] == day:
+            times.setdefault(c[5], []).append(c[4] // 1000)
+    makers = sorted(set().union(*[set(per_day[d]) for d in days]))
+    # A maker that is not a validating account today (it left, or the roster changed) is
+    # counted in the totals but not listed. Many of them would mean a misread file.
+    known = set(roster_wallets)
+    listed = [w for w in makers if w in known and clean(w, WALLET) is not _BAD]
+    if len(listed) * 10 < len(makers) * 9:
+        return no("too many block makers are not validating accounts")
+    return {
+        "generated_unix": now, "day": day, "head_height": height,
+        "days": days, "totals": [sum(per_day[d].values()) for d in days],
+        "accounts": [{"wallet": w, "counts": [per_day[d].get(w, 0) for d in days],
+                      "today_unix": sorted(times.get(w, []))[-2880:],
+                      "last_unix": last.get(w)} for w in listed],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="site data directory")
@@ -542,6 +714,18 @@ def main():
         chain = None
     if chain:
         write_json(os.path.join(out, "chain.json"), chain)
+
+    # Blocks per account, from the node's chain store (see chain_blocks). Optional: the
+    # file is simply not refreshed when the store cannot be read or the self-check fails,
+    # and its generated_unix then tells a reader it is old.
+    try:
+        blocks = chain_blocks(a.api, [x["wallet"].lower() for x in vals["accounts"]],
+                              int(time.time())) if (chain and vals) else None
+    except Exception as e:             # never let this optional file stop the others
+        print("blocks.json not written: %s" % type(e).__name__, file=sys.stderr)
+        blocks = None
+    if blocks:
+        write_json(os.path.join(out, "blocks.json"), blocks)
 
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):
         print("not published: %s" % what, file=sys.stderr)

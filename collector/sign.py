@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sign the published data files, so readers can check who published them.
 
-For every data file `<data>/<name>` (network.json, chain.json, validators.json,
+For every data file `<data>/<name>` (network.json, chain.json, validators.json, blocks.json,
 cycles/index.json, cycles/<day>.json) this writes `<data>/signed/<name>`:
 
     {"format": 2, "alg": "ECDSA-P256-SHA256", "key": "<key id>", "name": "<name>",
@@ -42,7 +42,7 @@ import tempfile
 
 OPENSSL = "/usr/bin/openssl" if os.path.exists("/usr/bin/openssl") else "openssl"
 ALG = "ECDSA-P256-SHA256"
-TOP = re.compile(r"^(network|chain|validators)\.json$")
+TOP = re.compile(r"^(network|chain|validators|blocks)\.json$")
 CYCLE = re.compile(r"^(index|[0-9]{1,6})\.json$")
 MAX_BYTES = 8 * 1024 * 1024
 
