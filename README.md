@@ -34,7 +34,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 |---|---|
 | `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
 | `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
-| `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run, published at least every 15 minutes. |
+| `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run, published every 5 minutes. |
 | `docs/data/blocks.json` | Who made (proposed) the 6529 chain's blocks, on the collecting node's current chain, for up to 7 chain days: `day` (the UTC day of the head block), `head_height`, `days` (day numbers, oldest first; a day starts at `day * 86400` UTC), `totals` (blocks per day, all makers) and `accounts`: per wallet, `counts` (its blocks per day, same order), `today_unix` (the slot time of each block it made today) and `last_unix` (the slot time of its latest block in those days). Only accounts that made a block in those days are listed; a maker that is not a validating account today is counted in `totals` but not listed. Counts are blocks proposed, not votes, and include blocks not yet final, so a count can drop after a reorganisation. Read from the node's chain store (see "Run it yourself"). |
 | `docs/data/cycles/<day>.json` | One cycle (day number = days since 1970-01-01 UTC): `state`, `window`, `header`, `cycle_root`, `history_root`, `history_count`, `certificate` (summary: level, weights, counts, roots), `compare`, `dual_run`, `other_roots` (a count), `finalized_unix`. |
 | `docs/data/cycles/index.json` | One summary line per cycle. |
@@ -43,8 +43,10 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/docs/data/<file>`
 
 Timing: the collector runs every 5 minutes. A commit is made when something other
-than the collection time changed, and at least every 15 minutes (so the chain's head
-in `chain.json` stays recent), so a file here is at most about 15 minutes old.
+than the collection time changed, and otherwise on every run too, since the chain's
+head (`chain.json`, `blocks.json`) moves all the time: a file here is at most about 5
+minutes old. This makes many small commits; old history may be trimmed from time to
+time, as readers only need the current files.
 
 Why not more often than 5 minutes: GitHub serves these raw files through a cache that
 keeps each file for 5 minutes (`cache-control: max-age=300`). A reader can therefore be

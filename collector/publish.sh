@@ -103,13 +103,14 @@ fi
 
 # network.json, chain.json and blocks.json carry the collection time and the chain's
 # head, so they (and their signed copies) change on every run. Commit only when something else
-# changed, or every 15 minutes: the apps show the chain's head from chain.json and call
-# it "no recent data" after 30 minutes, so an hourly refresh was too slow for them.
+# changed, or when the last publication is 4 minutes old, which with 5-minute runs is
+# every run: the apps show the chain's head and each account's latest block, and what
+# matters there is how recent they are. (The limit only stops two runs close together.)
 if "${G[@]}" diff --cached --quiet -- docs/data ':!docs/data/network.json' ':!docs/data/chain.json' \
      ':!docs/data/blocks.json' ':!docs/data/signed/network.json' ':!docs/data/signed/chain.json' \
      ':!docs/data/signed/blocks.json'; then
   last=$("${G[@]}" log -1 --format=%ct -- docs/data/network.json 2>/dev/null || echo 0)
-  if [ $(( $(date +%s) - ${last:-0} )) -lt 840 ]; then   # 840, not 900: runs are 5 minutes apart, so this gives every 15
+  if [ $(( $(date +%s) - ${last:-0} )) -lt 240 ]; then   # 240: runs are 5 minutes apart, so every run publishes (Hugo, 15 Nov 2026)
     "${G[@]}" reset --quiet --hard origin/main
     exit 0
   fi
