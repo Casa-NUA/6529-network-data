@@ -20,9 +20,19 @@ location, and it leaves out the certificate lists from which the node's own acco
 could be worked out. Some values are this node's own observations rather than
 network facts (strong_unix, finalized_unix, compare, dual_run, chain.json, blocks.json).
 
+From validator rc.18 it also writes days/<day>.json and days/index.json (each past
+day's validator list), history.json (network size and software per day) and
+awards.json (the chain's per-account awards over the last days, from the node's
+awards/network routes, and which keys proposed or voted in the last 10 minutes), and
+adds each account's public 6529 handle (from api.6529.io, the only request that leaves
+this machine) to validators.json. It keeps a small state file NEXT TO the data
+directory (never inside it): the handle cache, the day's last validator list and the
+award days that are settled.
+
 Python 3.9+, standard library only.
 
     python3 collect.py --out /path/to/site/data [--api http://127.0.0.1:6529/api/v1]
+                       [--state /path/outside/data/collector-state.json]
 """
 import argparse
 import glob
@@ -364,7 +374,9 @@ CHAIN = {
 }
 # Top-level keys of /chain that are known and deliberately NOT published: they describe
 # this machine, not the chain (whether it proposes blocks and why not, catch-up, counts).
-CHAIN_PRIVATE = ("proposes", "proposes_why", "catch_up", "records", "state_records", "switch")
+CHAIN_PRIVATE = ("proposes", "proposes_why", "catch_up", "records", "state_records", "switch",
+                 # rc.18: this node's own block turns and upload choice, and its sync state
+                 "own_turns", "hide_block_turns_upload", "pending", "sync")
 
 
 def clean_chain(chain, now):
@@ -384,6 +396,8 @@ def clean_chain(chain, now):
 # Fields the node is known to return and that are left out on purpose. Anything dropped
 # that is NOT listed here is reported on stderr: it is new, and someone should decide.
 KNOWN_UNPUBLISHED = set("%s (not in schema)" % k for k in (
+    # rc.18 chain details not needed by the apps (epoch of the finalized block, vesting rule id):
+    "chain.finalized.epoch", "chain.rules.vest_rule",
     # this node's own account and view (would identify the collecting node):
     "cycle.certificate.ours", "cycle.certificate.own_signed", "cycle.certificate.own_weight",
     "cycle.certificate.reported_by", "cycle.certificate.verified_here",
@@ -604,16 +618,497 @@ def chain_blocks(api, roster_wallets, now):
     }
 
 
+# ---- The collector's own state (never published) -----------------------------------
+# One JSON file NEXT TO the data directory, never inside it (everything inside the data
+# directory is published). It holds: the handle cache, the last validator list seen for
+# the current day (to write that day's file when the day changes), and the awards days
+# that are settled and final (they no longer change). Losing it costs only a few runs.
+STATE_VERSION = 1
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            st = json.load(f)
+        if isinstance(st, dict) and st.get("version") == STATE_VERSION:
+            return st
+    except (OSError, ValueError, RecursionError):
+        pass
+    return {"version": STATE_VERSION}
+
+
+def save_state(path, st):
+    try:
+        write_json(path, st)
+        os.chmod(path, 0o600)
+    except OSError as e:
+        print("state not saved: %s" % type(e).__name__, file=sys.stderr)
+
+
+# ---- Handles (public 6529 profile names) -------------------------------------------
+# Each validating wallet's handle, as 6529's public API shows it. A wallet with no
+# profile gets a placeholder ("id-0x…") there: published as null. At most 25 lookups
+# per run, each wallet re-checked at most once every 7 days, short timeouts, and a
+# failed lookup only means the cached value (or null) is used. Nothing here ever stops
+# a run.
+HANDLE_API = "https://api.6529.io/api/identities/"
+HANDLE_UA = "6529-network-data-collector (+https://github.com/Casa-NUA/6529-network-data)"
+HANDLE_RX = re.compile(r"^[A-Za-z0-9_.\-]{1,40}$")
+HANDLE_LOOKUPS = 25
+HANDLE_RECHECK_S = 7 * 86400
+HANDLE_BUDGET_S = 45
+HANDLE_TIMEOUT_S = 8
+HANDLE_KEEP_S = 60 * 86400   # cache entries of wallets no longer validating are dropped after this
+
+
+def HANDLE(v):
+    if isinstance(v, str) and HANDLE_RX.match(v) and not v.lower().startswith("id-"):
+        return v
+    return _BAD
+
+
+def fetch_handle(wallet, timeout=HANDLE_TIMEOUT_S):
+    """The wallet's handle, None when it has none; raises when the lookup failed."""
+    req = urllib.request.Request(HANDLE_API + wallet,
+                                 headers={"Accept": "application/json", "User-Agent": HANDLE_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(1000001)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    if len(body) > 1000000:
+        raise ValueError("answer too large")
+    if not body.strip():
+        return None
+    d = json.loads(body.decode("utf-8"))
+    h = d.get("handle") if isinstance(d, dict) else None
+    if not isinstance(h, str) or not h or h.lower().startswith("id-"):
+        return None                    # no profile (6529 shows a placeholder)
+    if HANDLE(h) is _BAD:
+        _dropped.add("handles.handle (unexpected form)")
+        return None
+    return h
+
+
+def update_handles(state, wallets, now, fetch=fetch_handle):
+    """Look up the handles that are due (see above). Returns the number looked up."""
+    cache = state.get("handles")
+    if not isinstance(cache, dict):
+        cache = {}
+    # keep only well-formed entries; forget wallets gone for a long time
+    current = set(wallets)
+    cache = {w: e for w, e in cache.items()
+             if clean(w, WALLET) is not _BAD and w == w.lower() and isinstance(e, dict)
+             and INT(e.get("t")) is not _BAD and (e.get("h") is None or HANDLE(e.get("h")) is not _BAD)
+             and (w in current or now - e["t"] < HANDLE_KEEP_S)}
+    state["handles"] = cache
+    due = [w for w in wallets if w not in cache or now - cache[w]["t"] >= HANDLE_RECHECK_S]
+    due.sort(key=lambda w: cache[w]["t"] if w in cache else -1)   # never looked up first
+    started, fails, done = time.time(), 0, 0
+    for w in due[:HANDLE_LOOKUPS]:
+        if fails >= 3 or time.time() - started > HANDLE_BUDGET_S:
+            break
+        try:
+            h = fetch(w)
+        except Exception:              # network, HTTP, JSON: try again on a later run
+            fails += 1
+            continue
+        fails = 0
+        cache[w] = {"h": h, "t": now}
+        done += 1
+    return done
+
+
+def handle_of(state, wallet):
+    e = (state.get("handles") or {}).get(wallet.lower())
+    h = e.get("h") if isinstance(e, dict) else None
+    return h if h is not None and HANDLE(h) is not _BAD else None
+
+
+# ---- Past days (days/<day>.json, days/index.json) ----------------------------------
+# The validator list as last collected on each past day. Written once, when the
+# collector sees the day change, from the last list it had for that day (kept in the
+# state file); days before this existed were rebuilt from this repository's own history
+# by backfill_days.py. A day's file is never rewritten.
+DAY_MACHINE = {"code": RE(r"^[0-9a-f]{8}$"), "weight": INT, "today": STR, "report": REPORT}
+
+
+def day_record(vals, state):
+    """A days/<day>.json record from a validators.json-shaped list; None if unusable."""
+    if not isinstance(vals, dict):
+        return None
+    day, w = clean(vals.get("cycle_day"), INT), clean(vals.get("w"), INT)
+    if day in (_BAD, None) or not isinstance(vals.get("accounts"), list):
+        return None
+    accounts = []
+    for a in vals["accounts"]:
+        if not isinstance(a, dict) or clean(a.get("wallet"), WALLET) in (_BAD, None):
+            _dropped.add("days.accounts[] (no valid wallet)")
+            continue
+        wallet = a["wallet"].lower()
+        machines = []
+        for m in (a.get("machines") if isinstance(a.get("machines"), list) else [])[:256]:
+            if not isinstance(m, dict):
+                continue
+            mm = clean({k: m.get(k) for k in DAY_MACHINE if k in m}, DAY_MACHINE, "days.machine")
+            if mm is not _BAD and mm.get("code"):
+                machines.append(mm)
+        tdh, weight = clean(a.get("tdh"), INT), clean(a.get("weight"), INT)
+        accounts.append({"wallet": wallet, "handle": handle_of(state, wallet),
+                         "tdh": None if tdh is _BAD else tdh,
+                         "weight": None if weight is _BAD else weight, "machines": machines})
+    if not accounts:
+        return None
+    accounts.sort(key=lambda x: x.get("weight") or 0, reverse=True)
+    return {"day": day, "final": True, "w": None if w is _BAD else w, "accounts": accounts}
+
+
+def day_files(out):
+    d = os.path.join(out, "days")
+    found = set()
+    if os.path.isdir(d) and not os.path.islink(d):
+        for n in os.listdir(d):
+            if n.endswith(".json") and n[:-5].isdigit() and len(n) <= 11:
+                found.add(int(n[:-5]))
+    return found
+
+
+def write_day(out, rec):
+    """Write days/<day>.json unless it exists (a day's file is never rewritten)."""
+    p = os.path.join(out, "days", "%d.json" % rec["day"])
+    if os.path.lexists(p):
+        return False
+    write_json(p, rec)
+    return True
+
+
+def write_days_index(out, today):
+    days = sorted(d for d in day_files(out) if today is None or d < today)
+    write_json(os.path.join(out, "days", "index.json"), {"days": days})
+    return days
+
+
+def roll_day(out, state, vals):
+    """Keep the newest list per day; when the day changes, write the previous day."""
+    wrote = None
+    last = state.get("last_vals")
+    if isinstance(last, dict) and isinstance(last.get("cycle_day"), int) \
+            and isinstance(vals.get("cycle_day"), int):
+        if vals["cycle_day"] > last["cycle_day"]:
+            rec = day_record(last, state)
+            if rec and write_day(out, rec):
+                wrote = rec["day"]
+        elif vals["cycle_day"] < last["cycle_day"]:
+            return None                # the node went back a day (resync): keep what we had
+    if isinstance(vals.get("cycle_day"), int):
+        state["last_vals"] = vals
+    return wrote
+
+
+# ---- history.json (one row per day, oldest first, today last) ----------------------
+def history_row(rec):
+    machines = [m for a in rec["accounts"] for m in a.get("machines") or []]
+    continents, software = {}, {}
+    for m in machines:
+        rep = m.get("report") or {}
+        c = rep.get("continent") if STR(rep.get("continent")) is not _BAD else None
+        s = rep.get("software") if REPORT["software"](rep.get("software")) is not _BAD else None
+        continents[c or "UNKNOWN"] = continents.get(c or "UNKNOWN", 0) + 1
+        software[s or "UNKNOWN"] = software.get(s or "UNKNOWN", 0) + 1
+    return {
+        "day": rec["day"], "validators": len(machines),
+        "signed": sum(1 for m in machines if m.get("today") == "SIGNED"),
+        "accounts": len(rec["accounts"]),
+        "accounts_signed": sum(1 for a in rec["accounts"]
+                               if any(m.get("today") == "SIGNED" for m in a.get("machines") or [])),
+        "w": rec.get("w"), "continents": continents, "software": software,
+    }
+
+
+def build_history(out, state, today_rec, now):
+    """Rows from the day files (cached by file size and time: they never change) + today."""
+    cache = state.get("history_rows")
+    cache = cache if isinstance(cache, dict) else {}
+    rows, keep = [], {}
+    today = today_rec["day"] if today_rec else None
+    for d in sorted(day_files(out)):
+        if today is not None and d >= today:
+            continue
+        p = os.path.join(out, "days", "%d.json" % d)
+        try:
+            st = os.lstat(p)
+            sig = "%d:%d" % (st.st_size, int(st.st_mtime))
+            c = cache.get(str(d))
+            if isinstance(c, dict) and c.get("sig") == sig and isinstance(c.get("row"), dict):
+                row = c["row"]
+            else:
+                with open(p) as f:
+                    rec = json.load(f)
+                if not isinstance(rec, dict) or rec.get("day") != d or not isinstance(rec.get("accounts"), list):
+                    continue
+                row = history_row(rec)
+            keep[str(d)] = {"sig": sig, "row": row}
+            rows.append(row)
+        except (OSError, ValueError, RecursionError, TypeError, AttributeError):
+            continue
+    state["history_rows"] = keep
+    if today_rec:
+        rows.append(history_row(today_rec))
+    cleaned = clean(rows, LIST(HISTORY_ROW, 4000), "history.days")
+    if cleaned is _BAD or not cleaned:
+        return None
+    return {"generated_unix": now, "days": cleaned}
+
+
+def COUNTS(v):  # {label: count}, e.g. machines per continent
+    return v if isinstance(v, dict) and len(v) <= 64 and all(
+        STR(k) is not _BAD and INT(n) is not _BAD for k, n in v.items()) else _BAD
+
+
+HISTORY_ROW = {"day": INT, "validators": INT, "signed": INT, "accounts": INT,
+               "accounts_signed": INT, "w": INT, "continents": COUNTS, "software": COUNTS}
+
+
+# ---- awards.json (6529 chain: per-account awards, and who votes right now) ---------
+# From the node's rc.18 routes:
+#   awards/network/days?limit=N          the chain's days, newest first (limit 1..64)
+#   awards/network/day/{d}?limit=1000[&after=<rank>]   per KEY, paged by rank; the
+#                                        answer's next_after is the next `after`, null at the end
+#   awards/network/day/{d}/blocks?limit=240[&after_slot=<slot>]   blocks with slot > after_slot,
+#                                        oldest first; next_after_slot for the next page
+# Per-key figures are summed per ACCOUNT. A day that is settled and final no longer
+# changes and is kept in the state file; the open day is read again every run.
+AWARD_DAYS = 7
+LIVE_WINDOW_S = 600
+AMOUNT = NUMSTR
+REC = RE(r"^(all|part|none)$")
+CODE = RE(r"^[0-9a-f]{8}$")
+AWARD = {"total": AMOUNT, "blocks_part": AMOUNT, "votes_part": AMOUNT}
+AWARD_ACCOUNT = {"wallet": WALLET, "blocks": INT, "votes": INT, "award": AWARD}
+AWARD_DAY = {"day": INT, "state": STR, "final": BOOL, "slots": INT, "blocks": INT,
+             "award_total": AMOUNT, "recorded": {"blocks": REC, "votes": REC},
+             "accounts": LIST(AWARD_ACCOUNT, 5000)}
+
+
+def _req_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+# What the node's awards routes are known to return. These answers are read field by
+# field (only the fields named in AWARD_DAY / AWARD_ACCOUNT end up in the file); a field
+# not listed here is new, and is named on stderr like any other unknown field.
+_AW_SUMMARY = {"day", "date", "currency", "state", "final", "slots", "blocks", "votes", "paid",
+               "paid_for", "paid_with", "earners", "settle", "recorded", "keys", "total_keys",
+               "next_after", "as_of"}
+_AW_KEY = {"rank", "key_id", "key_code", "account", "blocks", "votes", "votes_zero_weight",
+           "vote_weight", "paid", "paid_for"}
+_AW_PAID = {"award", "parts", "released", "fees", "forfeited", "credit_fees", "unvested"}
+_AW_AWARD = {"total", "blocks_part", "votes_part"}
+_AW_RECORDED = {"awards", "blocks", "votes"}
+_AW_BLOCKS = {"day", "date", "slots", "blocks", "recorded", "not_recorded", "rows",
+              "next_after_slot", "as_of"}
+_AW_ROW = {"slot", "time", "height", "root", "final", "proposer", "votes"}
+
+
+def _note_unknown(obj, known, path):
+    if isinstance(obj, dict):
+        for k in obj:
+            if k not in known:
+                _dropped.add("%s.%s (not in schema)" % (path, k))
+
+
+def award_day(api, summary_row):
+    """One day of awards.json from its summary row (days list) and its per-key pages."""
+    d = summary_row.get("day")
+    if not _req_int(d):
+        return None
+    keys, after = [], None
+    for _ in range(50):                # 50 pages of 1000 keys: far beyond any real day
+        page = get(api, "awards/network/day/%d?limit=1000%s" % (d, "" if after is None else "&after=%d" % after))
+        if not isinstance(page, dict) or page.get("day") != d or not isinstance(page.get("keys"), list):
+            return None
+        _note_unknown(page, _AW_SUMMARY, "awards.day")
+        keys += page["keys"]
+        nxt = page.get("next_after")
+        if nxt is None:
+            break
+        if not _req_int(nxt) or (after is not None and nxt <= after):
+            return None
+        after = nxt
+    else:
+        return None
+    per = {}
+    for k in keys:
+        if not isinstance(k, dict):
+            continue
+        _note_unknown(k, _AW_KEY, "awards.keys[]")
+        _note_unknown(k.get("paid"), _AW_PAID, "awards.keys[].paid")
+        _note_unknown((k.get("paid") or {}).get("award") if isinstance(k.get("paid"), dict) else None,
+                      _AW_AWARD, "awards.keys[].paid.award")
+        acct = k.get("account")
+        if clean(acct, WALLET) in (_BAD, None):
+            _dropped.add("awards.keys[].account (not a 0x+40 wallet)")
+            continue
+        a = per.setdefault(acct.lower(), {"blocks": None, "votes": None, "award": None})
+        for f in ("blocks", "votes"):
+            if _req_int(k.get(f)):
+                a[f] = (a[f] or 0) + k[f]
+        paid = k.get("paid")
+        award = paid.get("award") if isinstance(paid, dict) else None
+        if isinstance(award, dict):
+            parts = {f: award.get(f) for f in AWARD}
+            if all(isinstance(v, str) and _NUM.match(v) for v in parts.values()):
+                prev = a["award"] or {f: "0" for f in AWARD}
+                a["award"] = {f: str(int(prev[f]) + int(parts[f])) for f in AWARD}
+            else:
+                _dropped.add("awards.keys[].paid.award (unexpected form)")
+    accounts = []
+    for w, a in per.items():
+        # an account with nothing to show (no block, no vote, nothing paid) is left out
+        if not a["blocks"] and not a["votes"] and not (a["award"] and int(a["award"]["total"])):
+            continue
+        accounts.append(dict(a, wallet=w))
+    accounts.sort(key=lambda x: (-int((x["award"] or {}).get("total") or 0),
+                                 -(x["blocks"] or 0), -(x["votes"] or 0), x["wallet"]))
+    _note_unknown(summary_row, _AW_SUMMARY, "awards.days[]")
+    _note_unknown(summary_row.get("recorded"), _AW_RECORDED, "awards.days[].recorded")
+    paid = summary_row.get("paid")
+    total = ((paid or {}).get("award") or {}).get("total") if isinstance(paid, dict) else None
+    rec = summary_row.get("recorded") if isinstance(summary_row.get("recorded"), dict) else {}
+    out = clean({"day": d, "state": summary_row.get("state"), "final": summary_row.get("final"),
+                 "slots": summary_row.get("slots"), "blocks": summary_row.get("blocks"),
+                 "award_total": total,
+                 "recorded": {"blocks": rec.get("blocks"), "votes": rec.get("votes")},
+                 "accounts": accounts}, AWARD_DAY, "awards.day")
+    if out is _BAD or "day" not in out:
+        return None
+    for f in ("state", "final", "slots", "blocks", "award_total"):
+        out.setdefault(f, None)
+    out["recorded"] = {"blocks": out.get("recorded", {}).get("blocks"),
+                       "votes": out.get("recorded", {}).get("votes")}
+    if out["award_total"] is None:
+        for a in out["accounts"]:
+            a["award"] = None          # an open day pays nothing yet (contract: award null)
+    # Per-account blocks and votes only for a day this node recorded in full: on a day it
+    # recorded only in part, the counts would show (against blocks.json) the moment this node
+    # started recording, a hint about which account runs it (review, 15 Nov 2026).
+    for f, key in (("blocks", "blocks"), ("votes", "votes")):
+        if out["recorded"].get(key) != "all":
+            for a in out["accounts"]:
+                a[f] = None
+    for a in out["accounts"]:
+        for f in ("blocks", "votes", "award"):
+            a.setdefault(f, None)
+    return out
+
+
+def _head_recent(chain, now, most_s=120):
+    """True when the chain's newest block is at most `most_s` old (a lagging node would
+    otherwise publish an empty, fresh-looking `live`)."""
+    t = ((chain or {}).get("head") or {}).get("time")
+    return _req_int(t) and now * 1000 - t <= most_s * 1000
+
+
+def live_keys(api, chain, now):
+    """{key_code: unix time of its newest block} for blocks in the last LIVE_WINDOW_S."""
+    start, slot_ms = chain.get("start_time"), chain.get("slot_ms")
+    if not _req_int(start) or not _req_int(slot_ms) or not slot_ms:
+        return None
+    lo_ms = (now - LIVE_WINDOW_S) * 1000
+    after = max(-1, (lo_ms - start) // slot_ms - 1)
+    keys, recorded_any = {}, False
+    for d in range(lo_ms // 86400000, now // 86400 + 1):
+        a = after
+        for _ in range(20):
+            try:
+                page = get(api, "awards/network/day/%d/blocks?limit=240%s" % (
+                    d, "" if a < 0 else "&after_slot=%d" % a))
+            except urllib.error.HTTPError as e:
+                if e.code == 404:      # a day the chain does not have (before its start)
+                    break
+                raise
+            if not isinstance(page, dict) or page.get("day") != d or not isinstance(page.get("rows"), list):
+                return None
+            _note_unknown(page, _AW_BLOCKS, "awards.blocks")
+            if page.get("recorded") in ("all", "part"):
+                recorded_any = True
+            for r in page["rows"]:
+                _note_unknown(r, _AW_ROW, "awards.blocks.rows[]")
+                if not isinstance(r, dict) or not _req_int(r.get("time")) or r["time"] < lo_ms \
+                        or r["time"] > (now + 120) * 1000:
+                    continue
+                t = r["time"] // 1000
+                who = [r.get("proposer")] + (r.get("votes") if isinstance(r.get("votes"), list) else [])
+                for x in who:
+                    c = x.get("key_code") if isinstance(x, dict) else None
+                    if CODE(c) is not _BAD and keys.get(c, 0) < t:
+                        keys[c] = t
+            nxt = page.get("next_after_slot")
+            if nxt is None or not page["rows"]:
+                break
+            if not _req_int(nxt) or nxt <= a:
+                return None
+            a = nxt
+    return keys if recorded_any else None
+
+
+def build_awards(api, chain, state, now):
+    summary = get(api, "awards/network/days?limit=%d" % AWARD_DAYS)
+    rows = summary.get("days") if isinstance(summary, dict) else None
+    if not isinstance(rows, list):
+        return None
+    rows = [r for r in rows if isinstance(r, dict) and _req_int(r.get("day"))]
+    rows = sorted(rows, key=lambda r: r["day"])[-AWARD_DAYS:]
+    cache = state.get("award_days")
+    cache = cache if isinstance(cache, dict) else {}
+    days, keep = [], {}
+    for r in rows:
+        c = cache.get(str(r["day"]))
+        if isinstance(c, dict) and c.get("day") == r["day"]:
+            rec = c
+        else:
+            rec = award_day(api, r)
+            if rec is None:
+                continue
+        if rec.get("state") == "settled" and rec.get("final") is True:
+            keep[str(r["day"])] = rec  # settled and final: it no longer changes
+        days.append(rec)
+    state["award_days"] = keep
+    if not days:
+        return None
+    try:
+        live = live_keys(api, chain, now)
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        live = None
+    cur = chain.get("currency") or {}
+    return {
+        "generated_unix": now,
+        "currency": cur.get("symbol"), "decimals": cur.get("decimals"), "test": cur.get("test"),
+        "days": days,
+        "live": None if (live is None or not _head_recent(chain, now)) else {"as_of_unix": now, "window_s": LIVE_WINDOW_S,
+                                           "keys": dict(sorted(live.items()))},
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="site data directory")
     ap.add_argument("--api", default=None, help="node API base (default: auto-detect)")
+    ap.add_argument("--state", default=None,
+                    help="the collector's own state file, outside --out "
+                         "(default: collector-state.json next to the data directory)")
     a = ap.parse_args()
     a.api = a.api or detect_api()
     if not a.api:
         print("no validator API found on this machine", file=sys.stderr)
         return 1
     out = os.path.abspath(a.out)
+    state_path = os.path.abspath(a.state or os.path.join(os.path.dirname(out), "collector-state.json"))
+    if state_path == out or state_path.startswith(out + os.sep):
+        print("refusing: the state file must be outside the data directory", file=sys.stderr)
+        return 1
 
     try:
         status = get(a.api, "status")
@@ -686,7 +1181,12 @@ def main():
     # tell fresh data from a fresh network.json sitting next to an old file.
     now = int(time.time())
     vals = clean_validators(network)
+    state = load_state(state_path)
     if vals:
+        # Handles come from the cache here; new lookups run at the END of the run (after every
+        # file is written), so a slow api.6529.io can never delay the network data.
+        for x in vals["accounts"]:
+            x["handle"] = handle_of(state, x["wallet"])
         write_json(os.path.join(out, "validators.json"), vals)
     previous = {}
     try:
@@ -727,11 +1227,43 @@ def main():
     if blocks:
         write_json(os.path.join(out, "blocks.json"), blocks)
 
+    # Past days, history and awards. Optional: each is wrapped so that a failure only
+    # leaves that file as it was (its generated_unix then shows its age).
+    wrote_day, history, awards = None, None, None
+    try:
+        if vals:
+            wrote_day = roll_day(out, state, vals)
+        write_days_index(out, (vals or {}).get("cycle_day") or today)
+    except Exception as e:
+        print("days/ not updated: %s" % type(e).__name__, file=sys.stderr)
+    try:
+        today_rec = day_record(vals, state) if vals else None
+        history = build_history(out, state, today_rec, int(time.time()))
+    except Exception as e:
+        print("history.json not written: %s" % type(e).__name__, file=sys.stderr)
+    if history:
+        write_json(os.path.join(out, "history.json"), history)
+    try:
+        awards = build_awards(a.api, chain, state, int(time.time())) if chain else None
+    except Exception as e:
+        print("awards.json not written: %s" % type(e).__name__, file=sys.stderr)
+    if awards:
+        write_json(os.path.join(out, "awards.json"), awards)
+    if vals:
+        try:
+            update_handles(state, [x["wallet"].lower() for x in vals["accounts"]], int(time.time()))
+        except Exception as e:         # never let the handles stop the run
+            print("handles not updated: %s" % type(e).__name__, file=sys.stderr)
+    save_state(state_path, state)
+
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):
         print("not published: %s" % what, file=sys.stderr)
-    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s" % (
+    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s%s%s%s" % (
         len(index), network.get("latest_certified_day"), len(vals["accounts"]) if vals else 0,
-        "%s at height %s" % (chain.get("state"), (chain.get("head") or {}).get("height")) if chain else "-"))
+        "%s at height %s" % (chain.get("state"), (chain.get("head") or {}).get("height")) if chain else "-",
+        ", wrote day %d" % wrote_day if wrote_day else "",
+        ", history %d days" % len(history["days"]) if history else "",
+        ", awards %d days" % len(awards["days"]) if awards else ""))
     return 0
 
 

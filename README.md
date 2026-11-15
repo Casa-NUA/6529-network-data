@@ -11,8 +11,8 @@ one 6529 Validator node run by Casa NUA and published here as JSON. The mobile a
 - Most values are things every validator node receives from the network: cycle
   headers, roots, certificate summaries, the validator list. A few are this node's
   **own observations** and will differ slightly between nodes: `strong_unix`,
-  `finalized_unix`, `compare`, `dual_run`, and everything in `chain.json` and
-  `blocks.json`.
+  `finalized_unix`, `compare`, `dual_run`, and everything in `chain.json`,
+  `blocks.json` and `awards.json`.
 - The files do not include the validators' own signatures, so a certificate cannot be
   verified from this data alone. To check it, compare with your own node (below).
 - The collector publishes only what a strict schema in `collector/collect.py` allows.
@@ -33,9 +33,13 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 | File | What it is |
 |---|---|
 | `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
-| `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
+| `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). Each account also has `handle`: its public 6529 profile name, from 6529's public API (`api.6529.io`), or `null` when it has none or it has not been looked up yet. `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
 | `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run, published every 5 minutes. |
 | `docs/data/blocks.json` | Who made (proposed) the 6529 chain's blocks, on the collecting node's current chain, for up to 7 chain days: `day` (the UTC day of the head block), `head_height`, `days` (day numbers, oldest first; a day starts at `day * 86400` UTC), `totals` (blocks per day, all makers) and `accounts`: per wallet, `counts` (its blocks per day, same order), `today_unix` (the slot time of each block it made today) and `last_unix` (the slot time of its latest block in those days). Only accounts that made a block in those days are listed; a maker that is not a validating account today is counted in `totals` but not listed. Counts are blocks proposed, not votes, and include blocks not yet final, so a count can drop after a reorganisation. Read from the node's chain store (see "Run it yourself"). |
+| `docs/data/days/<day>.json` | One past day's validator list, as last collected on that day (each machine's state at the day's end): `day`, `final` (always `true`), `w`, and `accounts` (weight first): `wallet`, `handle`, `tdh`, `weight`, `machines` (`code`, `weight`, `today`, `report` as in `validators.json`). Written once, when the day changes, and never rewritten. Days before 15 November 2026 were rebuilt from this repository's own history (the last `validators.json` committed for that day, put through the same schema); their handles are those known when they were rebuilt, so some are `null`. A day's verdict and signed share are in `cycles/<day>.json`. |
+| `docs/data/days/index.json` | `{"days": [...]}`: the days that have a file, oldest first. Today is never listed (it is `validators.json`). |
+| `docs/data/history.json` | Network growth, one row per day, oldest first, the last row being today so far: `day`, `validators` and `signed` (machines listed, and machines that signed, at the day's end), `accounts` and `accounts_signed`, `w`, `continents` (machines per self-declared continent, `UNKNOWN` when none) and `software` (machines per self-declared version, `UNKNOWN` when none). Built from the day files and today's list; `generated_unix` is the collection time. |
+| `docs/data/awards.json` | The 6529 chain's awards (test currency), from the collecting node's `awards/network` routes (validator rc.18 and later): `currency`, `decimals`, `test`, and `days`, the last up to 7 chain days, newest last: `day`, `state` (`open` or `settled`), `final`, `slots`, `blocks` (the day's blocks), `award_total` (what the chain paid for the day; `null` until it settles, the next morning), `recorded` and `accounts`. Per account (`wallet`; an account with several keys is summed over them): `blocks` and `votes` (blocks it proposed and votes it cast that day, `null` when unknown) and `award` (`total`, `blocks_part`, `votes_part`, `null` for an open day). Amounts are decimal strings in the smallest unit (18 decimals). **`blocks` and `votes` count only what the collecting node recorded**: `recorded.blocks` / `recorded.votes` say `all`, `part` (it saw only part of the day, for example because it started during it) or `none` (then they are `null`). Awards are the chain's own figures, whatever the node recorded. An account with no block, no vote and nothing paid that day is left out. `live`: `as_of_unix`, `window_s` (600) and `keys`: every machine key code (as in `validators.json`) that proposed or voted in a block in the last `window_s` seconds before `as_of_unix`, with the time of its newest such block; `null` when the node recorded no blocks then. Per-account `blocks` and `votes` are published only for days the collecting node recorded in full (`recorded` = `all`); otherwise null. `live` is null when the routes cannot be read, when the node recorded no blocks in the window, or when the chain's newest block is more than 2 minutes old. |
 | `docs/data/cycles/<day>.json` | One cycle (day number = days since 1970-01-01 UTC): `state`, `window`, `header`, `cycle_root`, `history_root`, `history_count`, `certificate` (summary: level, weights, counts, roots), `compare`, `dual_run`, `other_roots` (a count), `finalized_unix`. |
 | `docs/data/cycles/index.json` | One summary line per cycle. |
 | `docs/data/signed/<same names>` | The same files, each wrapped with a signature (see "Signatures"). |
@@ -44,7 +48,7 @@ Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/doc
 
 Timing: the collector runs every 5 minutes. A commit is made when something other
 than the collection time changed, and otherwise on every run too, since the chain's
-head (`chain.json`, `blocks.json`) moves all the time: a file here is at most about 5
+head (`chain.json`, `blocks.json`, `awards.json`) moves all the time: a file here is at most about 5
 minutes old. This makes many small commits; old history may be trimmed from time to
 time, as readers only need the current files.
 
@@ -65,10 +69,18 @@ signing status, software version and, only where the operator chose to declare i
 continent, a country and whether the machine is at home or in a rack. Nobody verifies
 those declarations. Because this is a git repository, every past publication stays in
 its history: an operator who later removes a declared location cannot remove it from
-past snapshots here. `blocks.json` adds, for each wallet, how many blocks it made on
-the 6529 chain and when: public facts of that chain, which also show when an
-operator's validator was running. State and metro, which the network also carries, are not
-published here. There are no names, handles or IP addresses.
+past snapshots here. `blocks.json` and `awards.json` add, for each wallet, how many blocks it made and
+votes it cast on the 6529 chain, when, and what the chain paid it: public facts of that
+chain, which also show when an operator's validator was running (`awards.json`'s `live`
+shows which machines voted in the last 10 minutes). State and metro, which the network
+also carries, are not published here. There are no names beyond each account's public 6529 handle (which can be a real name, as its owner chose it on 6529), and no IP addresses.
+
+Handles: `validators.json` and `days/` show each validating wallet's **6529 handle**,
+the public profile name its owner chose on 6529 (as `https://api.6529.io/api/identities/<wallet>`
+returns it to anyone). They link a wallet to that public profile name, nothing more. The
+collector looks up at most 25 wallets per run and each wallet at most once every 7 days,
+so a changed or removed handle shows here within about a week; past day files keep the
+handle known when they were written. A wallet with no profile shows `null`.
 
 ## Signatures
 
@@ -139,7 +151,10 @@ collection times.
 The collector finds the node's loopback API by itself on macOS (desktop app or
 service install). Elsewhere, or if it finds nothing, pass it:
 `--api http://127.0.0.1:<port>/api/v1`. It uses only the Python standard library and
-reads the node's loopback API (`status`, `network`, `cycles/<day>`, `chain`). For
+reads the node's loopback API (`status`, `network`, `cycles/<day>`, `chain`, and from
+rc.18 `awards/network/days`, `awards/network/day/<day>` and
+`awards/network/day/<day>/blocks`). The one request that leaves the machine is the
+handle lookup at `api.6529.io`. For
 `blocks.json` it also reads one file of the node's chain store on disk, the index of
 blocks (`chain/<id>/index/blocks.log`: public chain facts), and the node's own block
 count from the API (`chain/me`, `awards`, `awards/days`), which it uses only to check
@@ -158,7 +173,11 @@ Copy `collector/collect.py`, `collector/sign.py` and `collector/publish.sh` to a
 from inside the clone or any git work tree. The clone is reset to `origin/main` on
 every run, so its content is whatever was last pushed: the script therefore collects
 and signs in its own `state/data` folder, which nothing from the repository enters,
-and only then copies the result into the clone. It also refuses a repository tree
+and only then copies the result into the clone. The collector's own state (the handle
+cache, the day's last validator list, settled award days) is `state/collector-state.json`,
+next to `state/data` and never published. Once, after installing this version, run
+`python3 -I collector/backfill_days.py --repo <clone> --out <collector>/state/data` to
+rebuild the past days from this repository's history. It also refuses a repository tree
 that contains links, submodules or git control files. Keep the signing key in the
 collector folder, never in the repository. See the comments in `collector/publish.sh`
 and `collector/casa.nua.6529-network-data.plist`.
@@ -172,3 +191,8 @@ Questions, corrections and security reports: bugs@nua.casa
 Code: MIT (see `LICENSE`). The data is public network data, republished as is. The collector is derived from
 [6529scan](https://github.com/nothingbugger/6529scan)'s (MIT) and keeps its output
 format, minus the fields described above.
+
+Notes for the publisher: run `collector/backfill_days.py` only after the handle cache has filled
+(about 9 runs), since a day file is never rewritten. Losing the state file across midnight loses that
+day's file (re-run the backfill). Handle lookups go to api.6529.io from the collector's own
+connection, so 6529 sees that address; only the public wallet being looked up is sent.

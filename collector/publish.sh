@@ -77,7 +77,9 @@ fi
 STATE="$HERE/state/data"
 mkdir -p "$STATE"
 find "$STATE" \( -name '*.tmp' -o -name '.DS_Store' \) -type f -delete
-$PY "$HERE/collect.py" --out "$STATE"
+# The collector's own state (handle cache, the day's last validator list, settled award
+# days) sits NEXT TO state/data, never inside it: everything inside state/data is published.
+$PY "$HERE/collect.py" --out "$STATE" --state "$HERE/state/collector-state.json"
 KEY="${SIGNING_KEY:-$HERE/signing-key.pem}"
 if [ -f "$KEY" ]; then
   $PY "$HERE/sign.py" --data "$STATE" --key "$KEY" >/dev/null
@@ -101,14 +103,15 @@ if [ "$("${G[@]}" ls-files docs/data | sed 's|^docs/data/||' | LC_ALL=C sort)" !
   exit 1
 fi
 
-# network.json, chain.json and blocks.json carry the collection time and the chain's
-# head, so they (and their signed copies) change on every run. Commit only when something else
+# network.json, chain.json, blocks.json, history.json and awards.json carry the collection
+# time and the chain's head, so they (and their signed copies) change on every run. Commit only when something else
 # changed, or when the last publication is 4 minutes old, which with 5-minute runs is
 # every run: the apps show the chain's head and each account's latest block, and what
 # matters there is how recent they are. (The limit only stops two runs close together.)
 if "${G[@]}" diff --cached --quiet -- docs/data ':!docs/data/network.json' ':!docs/data/chain.json' \
-     ':!docs/data/blocks.json' ':!docs/data/signed/network.json' ':!docs/data/signed/chain.json' \
-     ':!docs/data/signed/blocks.json'; then
+     ':!docs/data/blocks.json' ':!docs/data/history.json' ':!docs/data/awards.json' \
+     ':!docs/data/signed/network.json' ':!docs/data/signed/chain.json' \
+     ':!docs/data/signed/blocks.json' ':!docs/data/signed/history.json' ':!docs/data/signed/awards.json'; then
   last=$("${G[@]}" log -1 --format=%ct -- docs/data/network.json 2>/dev/null || echo 0)
   if [ $(( $(date +%s) - ${last:-0} )) -lt 240 ]; then   # 240: runs are 5 minutes apart, so every run publishes (Hugo, 15 Nov 2026)
     "${G[@]}" reset --quiet --hard origin/main

@@ -2,7 +2,8 @@
 """Sign the published data files, so readers can check who published them.
 
 For every data file `<data>/<name>` (network.json, chain.json, validators.json, blocks.json,
-cycles/index.json, cycles/<day>.json) this writes `<data>/signed/<name>`:
+history.json, awards.json, cycles/index.json, cycles/<day>.json, days/index.json,
+days/<day>.json) this writes `<data>/signed/<name>`:
 
     {"format": 2, "alg": "ECDSA-P256-SHA256", "key": "<key id>", "name": "<name>",
      "payload": "<the data file's exact text>",
@@ -42,8 +43,9 @@ import tempfile
 
 OPENSSL = "/usr/bin/openssl" if os.path.exists("/usr/bin/openssl") else "openssl"
 ALG = "ECDSA-P256-SHA256"
-TOP = re.compile(r"^(network|chain|validators|blocks)\.json$")
+TOP = re.compile(r"^(network|chain|validators|blocks|history|awards)\.json$")
 CYCLE = re.compile(r"^(index|[0-9]{1,6})\.json$")
+SUBDIRS = ("cycles", "days")          # each holds index.json and <day>.json only
 MAX_BYTES = 8 * 1024 * 1024
 
 
@@ -94,10 +96,11 @@ def read_regular(path):
 
 def data_files(root):
     names = [n for n in sorted(os.listdir(root)) if TOP.match(n)]
-    cyc = os.path.join(root, "cycles")
-    if os.path.lexists(cyc):
-        real_dir(cyc, "cycles")
-        names += ["cycles/" + n for n in sorted(os.listdir(cyc)) if CYCLE.match(n)]
+    for sub in SUBDIRS:
+        d = os.path.join(root, sub)
+        if os.path.lexists(d):
+            real_dir(d, sub)
+            names += [sub + "/" + n for n in sorted(os.listdir(d)) if CYCLE.match(n)]
     return names
 
 
@@ -124,7 +127,7 @@ def main():
     root = os.path.abspath(a.data)
     real_dir(root, "data directory")
     out = os.path.join(root, "signed")
-    for d in (out, os.path.join(out, "cycles")):
+    for d in [out] + [os.path.join(out, sub) for sub in SUBDIRS]:
         if os.path.lexists(d):
             real_dir(d, "signed directory")
         else:
@@ -163,9 +166,9 @@ def main():
                 raise Refuse("signature of %s does not verify" % name)
             write_text(dst, envelope_text(key_id, name, payload, sig))
             signed += 1
-        # An envelope whose data file is gone must go too. Only inside signed/ and
-        # signed/cycles/, both checked above to be plain directories.
-        for sub in ("", "cycles"):
+        # An envelope whose data file is gone must go too. Only inside signed/,
+        # signed/cycles/ and signed/days/, all checked above to be plain directories.
+        for sub in ("",) + SUBDIRS:
             d = os.path.join(out, sub)
             for n in os.listdir(d):
                 p = os.path.join(d, n)
