@@ -41,8 +41,8 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/docs/data/<file>`
 
 Timing: the collector runs every 5 minutes. A commit is made when something other
-than the collection time changed, and at least once an hour, so when nothing is
-changing a file here can be up to about an hour old.
+than the collection time changed, and at least every 15 minutes (so the chain's head
+in `chain.json` stays recent), so a file here is at most about 15 minutes old.
 
 Why not more often than 5 minutes: GitHub serves these raw files through a cache that
 keeps each file for 5 minutes (`cache-control: max-age=300`). A reader can therefore be
