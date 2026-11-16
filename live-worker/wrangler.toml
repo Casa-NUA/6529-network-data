@@ -1,0 +1,42 @@
+# 6529 Monitor live chain relay — a Cloudflare Worker (contract of 16 Nov 2026). See README.md.
+# Stores ONE thing: the latest signed live.json envelope, in a Durable Object.
+name = "monitor6529-live"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+# No per-version preview URLs: only the one workers.dev address answers.
+preview_urls = false
+
+# The latest envelope. One instance (idFromName("live")).
+[[durable_objects.bindings]]
+name = "LIVE"
+class_name = "LiveStore"
+
+# Creates the LiveStore class on the first deploy (SQLite-backed storage, the kind Cloudflare
+# recommends for new classes; only storage.get/put are used). Never edit or remove this entry
+# once deployed: later class changes need a NEW [[migrations]] entry with a new tag.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LiveStore"]
+
+# A limit on POSTs per address (10 a minute; the collector sends 2). Only POST is limited.
+# The address is used for this one check and is not stored. namespace_id must be unique in the
+# account: the push relay uses 6529.
+[[ratelimits]]
+name = "RL"
+namespace_id = "6530"
+simple = { limit = 10, period = 60 }
+
+# Optional limit on GETs per address. The app GETs every ~10 s while the Chain page is open
+# (6 a minute); 60 a minute leaves room for several devices behind one address. (A WAF rate
+# limiting rule cannot be set on workers.dev; see README.) On since the first deploy.
+[[ratelimits]]
+name = "RL_GET"
+namespace_id = "6531"
+simple = { limit = 60, period = 60 }
+
+# No request logs kept by the Worker: no IPs, no bodies.
+[observability]
+enabled = false
+
+# No secrets and no vars: the signature is the credential, and the pinned keys are in live.js.

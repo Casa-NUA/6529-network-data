@@ -196,3 +196,25 @@ Notes for the publisher: run `collector/backfill_days.py` only after the handle 
 (about 9 runs), since a day file is never rewritten. Losing the state file across midnight loses that
 day's file (re-run the backfill). Handle lookups go to api.6529.io from the collector's own
 connection, so 6529 sees that address; only the public wallet being looked up is sent.
+
+## Live chain feed (16 Nov 2026)
+
+Besides the files in this repository, the collecting machine runs `collector/live.py` every 30 s
+(launchd agent `collector/casa.nua.6529-live.plist`). It reads the last 60 slots of the 6529 chain
+from the same node, signs them like every file here (name `live.json`, same keys and envelope) and
+posts them to a Cloudflare Worker (`live-worker/`), which keeps only the latest envelope and serves
+it at https://monitor6529-live.casanua.workers.dev/v1/live. The apps read it only while their Chain
+page is open, and check the signature themselves; the Worker accepts a post only with a valid
+signature from the pinned keys, never an older one, within a short clock window.
+
+Privacy rules: a block is published only once later blocks by other accounts confirm it (with votes
+cast at or after its slot from at least 3 keys of other accounts, in a block whose slot started at
+least 30 s before), and each run starts after a random pause, so what appears and when depends on
+the public chain, not on what this node saw first. The page therefore runs about 1.5 to 3 minutes
+behind the chain.
+
+Known limit: the feed comes from one node. When that node or its machine stops (sleep, network,
+restart, update), the feed goes stale at the same moment that node's own key stops voting on the
+chain, so an observer comparing the two over several outages could work out which account runs the
+collecting node. The files above have the same property at a coarser 5-minute grain. The fix is to
+feed the collector from a separate, non-voting validator; planned.

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The live chain feed (live.py): every 30 s, one signed live.json POSTed to the
+     monitor6529-live Worker. Runs from the SAME fixed copy as casa.nua.6529-network-data
+     (~/Library/Application Support/6529-network-data/, with live.py and the updated sign.py
+     copied there by hand), never from a clone. Uses that folder's signing-key.pem.
+     Install: set LIVE_URL below to the deployed Worker, copy this file to ~/Library/LaunchAgents/ and
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/casa.nua.6529-live.plist
+     Stop: launchctl bootout gui/$(id -u)/casa.nua.6529-live
+     Output: nothing while all is well; one line per run that publishes nothing.
+     Each run first waits a random 0-10 s (so its phase is not tied to the chain's slots). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>casa.nua.6529-live</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-I</string>
+    <string>-B</string>
+    <string>/Users/hugofaz/Library/Application Support/6529-network-data/live.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TZ</key><string>UTC</string>
+    <key>LIVE_URL</key><string>https://monitor6529-live.casanua.workers.dev/v1/live</string>
+    <!-- Its own temp folder (live.py makes it, mode 700): signing temp files never go to a shared /tmp. -->
+    <key>TMPDIR</key><string>/Users/hugofaz/Library/Application Support/6529-network-data/tmp-live/</string>
+    <!-- live.py cuts this log to its last 64 KB when it passes 1 MB (same path as below). -->
+    <key>LIVE_LOG</key><string>/Users/hugofaz/Claude Servers/6529 Validator monitor/6529-live.log</string>
+  </dict>
+  <key>StartInterval</key><integer>30</integer>
+  <key>RunAtLoad</key><true/>
+  <!-- Low priority: it must never slow the validator down. -->
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/hugofaz/Claude Servers/6529 Validator monitor/6529-live.log</string>
+  <key>StandardErrorPath</key><string>/Users/hugofaz/Claude Servers/6529 Validator monitor/6529-live.log</string>
+</dict>
+</plist>

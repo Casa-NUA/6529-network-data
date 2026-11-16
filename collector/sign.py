@@ -111,6 +111,22 @@ def envelope_text(key_id, name, payload_text, sig):
                       separators=(",", ":"), sort_keys=True)
 
 
+def public_key(key):
+    """(key id, public key PEM bytes) of the private key file `key`, via openssl."""
+    der = run(["ec", "-in", key, "-pubout", "-outform", "DER"])
+    return hashlib.sha256(der).hexdigest()[:16], run(["ec", "-in", key, "-pubout"])
+
+
+def sign_envelope(key, key_id, pub_pem_path, name, raw):
+    """The envelope text for data bytes `raw` published as `name`, signed with `key` and
+    checked against its own public key before it is returned. Used by main() and live.py."""
+    message = name.encode("utf-8") + b"\n" + raw
+    sig = run(["dgst", "-sha256", "-sign", key], message)
+    if not verify(pub_pem_path, message, sig):
+        raise Refuse("signature of %s does not verify" % name)
+    return envelope_text(key_id, name, raw.decode("utf-8"), sig)
+
+
 def write_text(path, text):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -133,13 +149,12 @@ def main():
         else:
             os.mkdir(d)
 
-    der = run(["ec", "-in", a.key, "-pubout", "-outform", "DER"])
-    key_id = hashlib.sha256(der).hexdigest()[:16]
+    key_id, pub = public_key(a.key)
     fd, pub_pem = tempfile.mkstemp(suffix=".pem")
     os.close(fd)
     try:
         with open(pub_pem, "wb") as f:
-            f.write(run(["ec", "-in", a.key, "-pubout"]))
+            f.write(pub)
         wanted, signed, kept = set(), 0, 0
         for name in data_files(root):
             raw = read_regular(os.path.join(root, name))
@@ -161,10 +176,7 @@ def main():
                     continue
             except (OSError, ValueError, KeyError, TypeError, Refuse):
                 pass
-            sig = run(["dgst", "-sha256", "-sign", a.key], message)
-            if not verify(pub_pem, message, sig):
-                raise Refuse("signature of %s does not verify" % name)
-            write_text(dst, envelope_text(key_id, name, payload, sig))
+            write_text(dst, sign_envelope(a.key, key_id, pub_pem, name, raw))
             signed += 1
         # An envelope whose data file is gone must go too. Only inside signed/,
         # signed/cycles/ and signed/days/, all checked above to be plain directories.

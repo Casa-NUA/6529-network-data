@@ -112,10 +112,20 @@ def detect_api():
             return api
     return DEFAULT_API if _is_validator(DEFAULT_API) else None
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is a failure: no request is ever sent anywhere a server points to."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+# One opener for every request: no proxy (whatever the environment says), no redirects.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
 def get(api, path, timeout=20):
     req = urllib.request.Request(api.rstrip("/") + "/" + path.lstrip("/"),
                                  headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with OPENER.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -672,7 +682,7 @@ def fetch_handle(wallet, timeout=HANDLE_TIMEOUT_S):
     req = urllib.request.Request(HANDLE_API + wallet,
                                  headers={"Accept": "application/json", "User-Agent": HANDLE_UA})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with OPENER.open(req, timeout=timeout) as r:
             body = r.read(1000001)
     except urllib.error.HTTPError as e:
         if e.code == 404:
