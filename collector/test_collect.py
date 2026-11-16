@@ -211,8 +211,10 @@ class Awards(unittest.TestCase):
         node = FakeNode(routes())
         collect.get = node
         st = {}
-        a = collect.build_awards("x", CHAIN, st, NOW)
-        self.assertEqual(set(a), {"generated_unix", "currency", "decimals", "test", "days", "live"})
+        a = collect.build_awards("x", CHAIN, st, NOW, [W1, W2])
+        self.assertEqual(set(a), {"generated_unix", "currency", "decimals", "test", "days", "live",
+                                  "balances"})
+        self.assertIsNone(a["balances"])          # no chain/account route here (older node)
         self.assertEqual((a["currency"], a["decimals"], a["test"]), ("$fake6529", 18, True))
         self.assertEqual([d["day"] for d in a["days"]], [20771, 20772])      # newest last
         settled, open_ = a["days"]
@@ -258,6 +260,155 @@ class Awards(unittest.TestCase):
         collect.get = FakeNode(r)
         a = collect.build_awards("x", CHAIN, {}, NOW)
         self.assertIsNone(a["live"])                                        # nothing recorded
+
+
+def account_answer(wallet, available="21", vesting="19", earned="40", blocks=7, own=False):
+    return {"account": wallet, "kind": "address", "own": own, "currency": "$fake6529",
+            "available": available, "vesting": vesting,
+            "validator": {"authorized": True, "on_list": True, "since_day": 20770,
+                          "since_date": "2026-11-13", "days": []},
+            "keys": [{"key_id": "0x" + "9" * 64, "key_code": "0000000a", "own": own}],
+            "days": [], "totals": {"earned": earned, "blocks": blocks, "from_day": None,
+                                   "from_date": None},
+            "faults": [{"day": 20772, "what": "secret"}] if own else [], "as_of": {"height": 1}}
+
+
+class Clock(object):
+    def __init__(self, t, step=0.0):
+        self.t, self.step = float(t), step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+class Balances(unittest.TestCase):
+    def setUp(self):
+        collect._dropped.clear()
+        self.real_get = collect.get
+
+    def tearDown(self):
+        collect.get = self.real_get
+
+    def node(self, wallets, **kw):
+        return FakeNode({"chain/account/%s" % w: account_answer(w, **kw) for w in wallets})
+
+    def test_schema_and_own_dropped(self):
+        collect.get = FakeNode({"chain/account/%s" % W1: account_answer(W1, own=True),
+                                "chain/account/%s" % W2: account_answer(W2, earned="50")})
+        st = {}
+        b = collect.build_balances("x", st, [W1, W2], clock=Clock(NOW))
+        self.assertEqual(set(b), {"as_of_unix", "accounts"})
+        self.assertEqual(b["as_of_unix"], NOW)
+        self.assertEqual(b["accounts"], [
+            {"wallet": W2, "balance": "21", "vesting": "19", "earned": "50", "blocks": 7},
+            {"wallet": W1, "balance": "21", "vesting": "19", "earned": "40", "blocks": 7}])
+        text = json.dumps(b) + json.dumps(st)
+        for word in ("own", "faults", "secret", "key_code", "kind", "as_of\""):
+            self.assertNotIn(word, text.replace("as_of_unix", ""))
+        self.assertEqual(collect._dropped, set())               # every answer field is known
+
+    def test_strict_forms(self):
+        bad = {W1: account_answer(W1, available="-1"),            # not digits
+               W2: account_answer(W2, earned="1" * 81),           # longer than 80
+               W3: account_answer(W3, blocks="7")}                # blocks must be an int
+        wd = "0x" + "d4" * 20
+        bad[wd] = account_answer("0x" + "e5" * 20)                # answer for another account
+        collect.get = FakeNode({"chain/account/%s" % w: a for w, a in bad.items()})
+        self.assertIsNone(collect.build_balances("x", {}, [W1, W2, W3, wd], clock=Clock(NOW)))
+        r = account_answer(W1)
+        r["vesting"] = 19                                          # a number, not a string
+        collect.get = FakeNode({"chain/account/%s" % W1: r})
+        self.assertIsNone(collect.build_balances("x", {}, [W1], clock=Clock(NOW)))
+        self.assertIsNone(collect.build_balances("x", {}, [], clock=Clock(NOW)))   # no list, no cache
+
+    def test_rotation_freshness_and_as_of(self):
+        # The figures below assume 40 reads a run; the deployed value may differ.
+        saved, collect.BALANCE_FETCHES = collect.BALANCE_FETCHES, 40
+        self.addCleanup(setattr, collect, "BALANCE_FETCHES", saved)
+        wallets = ["0x%040x" % i for i in range(100)]
+        node = self.node(wallets)
+        collect.get = node
+        st = {}
+        b = collect.build_balances("x", st, wallets, clock=Clock(NOW))
+        self.assertEqual(len(node.asked), collect.BALANCE_FETCHES)
+        self.assertEqual(len(b["accounts"]), 40)                  # only what was ever fetched
+        b = collect.build_balances("x", st, wallets, clock=Clock(NOW + 300))
+        b = collect.build_balances("x", st, wallets, clock=Clock(NOW + 600))
+        self.assertEqual(len(set(node.asked)), 100)                # each once, never-fetched first
+        self.assertEqual(len(node.asked), 120)
+        self.assertEqual(b["as_of_unix"], NOW)                     # the oldest published fetch
+        b = collect.build_balances("x", st, wallets, clock=Clock(NOW + 900))
+        self.assertEqual(node.asked[-40:], ["chain/account/" + w for w in wallets[20:60]])   # oldest first
+        self.assertEqual(b["as_of_unix"], NOW + 300)
+
+    def test_missing_or_null_field_refused(self):
+        for drop in ("available", "vesting"):
+            r = account_answer(W1)
+            r.pop(drop)
+            collect.get = FakeNode({"chain/account/%s" % W1: r})
+            self.assertIsNone(collect.fetch_balance("x", W1))
+            r = account_answer(W1)
+            r[drop] = None
+            collect.get = FakeNode({"chain/account/%s" % W1: r})
+            self.assertIsNone(collect.fetch_balance("x", W1))
+        r = account_answer(W1)
+        r["totals"]["earned"] = None
+        collect.get = FakeNode({"chain/account/%s" % W1: r})
+        self.assertIsNone(collect.fetch_balance("x", W1))
+        # a bad or too old cached row is dropped, never published
+        st = {"balances": {W1: {"balance": "1", "vesting": None, "earned": "1", "blocks": 1, "t": NOW},
+                           W2: {"balance": "1", "vesting": "1", "earned": "1", "blocks": 1, "t": NOW - 7200}}}
+        collect.get = FakeNode({})
+        b = collect.build_balances("x", st, [W1, W2], fetch=lambda a, w: (_ for _ in ()).throw(OSError()), clock=Clock(NOW))
+        self.assertIsNone(b)
+
+    def test_left_validators_dropped_and_zero_omitted(self):
+        collect.get = self.node([W1, W2])
+        st = {}
+        collect.build_balances("x", st, [W1, W2], clock=Clock(NOW))
+        collect.get = FakeNode({"chain/account/%s" % W1: account_answer(W1),
+                                "chain/account/%s" % W3: account_answer(W3, "0", "0", "0", 0)})
+        b = collect.build_balances("x", st, [W1, W3], clock=Clock(NOW + 300))
+        self.assertEqual(set(st["balances"]), {W1, W3})             # W2 left the validators
+        self.assertEqual([x["wallet"] for x in b["accounts"]], [W1])   # W3 all zeros: left out
+        self.assertEqual(b["as_of_unix"], NOW + 300)
+
+    def test_route_missing_gives_null(self):
+        collect.get = FakeNode({})
+        st = {"balances": {W1: {"balance": "1", "vesting": "1", "earned": "1", "blocks": 1, "t": NOW}}}
+        before = json.dumps(st)
+        self.assertIsNone(collect.build_balances("x", st, [W1, W2], clock=Clock(NOW + 60)))
+        self.assertEqual(json.dumps(st), before)                     # nothing else changes
+
+    def test_failures_budget_and_cache(self):
+        wallets = ["0x%040x" % i for i in range(50)]
+        st = {"balances": {wallets[0]: {"balance": "5", "vesting": "0", "earned": "5", "blocks": 1,
+                                        "t": NOW - 100},
+                           "0xnot": {"balance": "1"}, wallets[1]: {"balance": "<b>", "t": NOW}}}
+        calls = []
+
+        def boom(api, w):
+            calls.append(w)
+            raise OSError("timeout")
+        b = collect.build_balances("x", st, wallets, fetch=boom, clock=Clock(NOW))
+        self.assertEqual(len(calls), 3)                              # gives up after 3 failures
+        self.assertEqual(b, {"as_of_unix": NOW - 100, "accounts": [
+            {"wallet": wallets[0], "balance": "5", "vesting": "0", "earned": "5", "blocks": 1}]})
+        self.assertEqual(set(st["balances"]), {wallets[0]})          # bad entries dropped
+        calls[:] = []
+        b = collect.build_balances("x", st, wallets, fetch=lambda a, w: calls.append(w) or
+                                   {"balance": "1", "vesting": "0", "earned": "1", "blocks": 0},
+                                   clock=Clock(NOW, step=1.0))       # each fetch takes 1 s
+        self.assertLessEqual(len(calls), collect.BALANCE_BUDGET_S + 2)
+
+    def test_in_awards(self):
+        r = routes()
+        for w in (W1, W2):
+            r["chain/account/%s" % w] = account_answer(w)
+        collect.get = FakeNode(r)
+        a = collect.build_awards("x", CHAIN, {}, NOW, [W1.upper().replace("0X", "0x"), W2])
+        self.assertEqual([x["wallet"] for x in a["balances"]["accounts"]], [W1, W2])
 
 
 class SignNames(unittest.TestCase):

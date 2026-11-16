@@ -23,11 +23,13 @@ network facts (strong_unix, finalized_unix, compare, dual_run, chain.json, block
 From validator rc.18 it also writes days/<day>.json and days/index.json (each past
 day's validator list), history.json (network size and software per day) and
 awards.json (the chain's per-account awards over the last days, from the node's
-awards/network routes, and which keys proposed or voted in the last 10 minutes), and
+awards/network routes, and which keys proposed or voted in the last 10 minutes; from
+rc.19 also each validating account's balance, vesting and earned total, read in
+rotation from chain/account/<wallet>), and
 adds each account's public 6529 handle (from api.6529.io, the only request that leaves
 this machine) to validators.json. It keeps a small state file NEXT TO the data
 directory (never inside it): the handle cache, the day's last validator list and the
-award days that are settled.
+award days that are settled, and the last balances read.
 
 Python 3.9+, standard library only.
 
@@ -1064,7 +1066,7 @@ def live_keys(api, chain, now):
     return keys if recorded_any else None
 
 
-def build_awards(api, chain, state, now):
+def build_awards(api, chain, state, now, wallets=None):
     summary = get(api, "awards/network/days?limit=%d" % AWARD_DAYS)
     rows = summary.get("days") if isinstance(summary, dict) else None
     if not isinstance(rows, list):
@@ -1092,6 +1094,14 @@ def build_awards(api, chain, state, now):
         live = live_keys(api, chain, now)
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
         live = None
+    if wallets is None:                # no validator list this run: refresh what is cached
+        cached = state.get("balances")
+        wallets = sorted(cached) if isinstance(cached, dict) else []
+    try:
+        balances = build_balances(api, state, [w.lower() for w in wallets])
+    except Exception as e:             # never let the balances stop awards.json
+        print("balances not built: %s" % type(e).__name__, file=sys.stderr)
+        balances = None
     cur = chain.get("currency") or {}
     return {
         "generated_unix": now,
@@ -1099,7 +1109,109 @@ def build_awards(api, chain, state, now):
         "days": days,
         "live": None if (live is None or not _head_recent(chain, now)) else {"as_of_unix": now, "window_s": LIVE_WINDOW_S,
                                            "keys": dict(sorted(live.items()))},
+        "balances": balances,
     }
+
+
+# ---- awards.json "balances" (per-account chain balances, validator rc.19) ----------
+# From the node's rc.19 route chain/account/<wallet>, which answers for ANY account:
+#   balance = `available` (what the account can send), vesting = `vesting`,
+#   earned = totals.earned (all days), blocks = totals.blocks (all days).
+# Everything else in the answer is left out, in particular `own` (it would single out
+# the collecting node's account) and `faults`. Every validating account is treated the
+# same way: refreshed in rotation, oldest fetch first, at most BALANCE_FETCHES per run
+# within BALANCE_BUDGET_S; the others come from the state file. An account that left
+# validators.json is dropped. as_of_unix is the OLDEST fetch time among the accounts
+# published. Null when the node has no such route (404, an older node) or when nothing
+# is known yet (no validator list and no cache, or every fetch failed on a first run).
+BALANCE_FETCHES = 80
+BALANCE_TIMEOUT_S = 4
+BALANCE_BUDGET_S = 15
+# A cached row older than this is no longer published (reads have kept failing for it).
+BALANCE_MAX_AGE_S = 3600
+BALANCE = {"wallet": WALLET, "balance": AMOUNT, "vesting": AMOUNT, "earned": AMOUNT, "blocks": INT}
+_BAL_ANSWER = {"account", "kind", "own", "currency", "available", "vesting", "validator", "keys",
+               "days", "totals", "faults", "as_of"}
+_BAL_TOTALS = {"earned", "blocks", "from_day", "from_date"}
+
+
+class RouteMissing(Exception):
+    pass
+
+
+def fetch_balance(api, wallet, timeout=BALANCE_TIMEOUT_S):
+    """{balance, vesting, earned, blocks} of one account; None when the answer does not fit
+    the schema; raises RouteMissing on 404 and anything else on a failed request."""
+    try:
+        r = get(api, "chain/account/%s" % wallet, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RouteMissing()
+        raise
+    if not isinstance(r, dict):
+        return None
+    _note_unknown(r, _BAL_ANSWER, "awards.balances.answer")
+    tot = r.get("totals") if isinstance(r.get("totals"), dict) else {}
+    _note_unknown(tot, _BAL_TOTALS, "awards.balances.answer.totals")
+    acct = r.get("account")
+    if not isinstance(acct, str) or acct.lower() != wallet.lower():
+        _dropped.add("awards.balances (answer for another account)")
+        return None
+    rec = {"wallet": wallet, "balance": r.get("available"), "vesting": r.get("vesting"),
+           "earned": tot.get("earned"), "blocks": tot.get("blocks")}
+    out = clean(rec, BALANCE, "awards.balances.accounts[]")
+    if out is _BAD or set(out) != set(BALANCE) or any(out.get(k) is None for k in BALANCE):
+        _dropped.add("awards.balances.accounts[] (incomplete answer)")
+        return None
+    return {k: out[k] for k in ("balance", "vesting", "earned", "blocks")}
+
+
+def build_balances(api, state, wallets, fetch=fetch_balance, clock=time.time):
+    """awards.json "balances" (see above), or None when the node has no account route."""
+    now = int(clock())
+    cache = state.get("balances")
+    cache = cache if isinstance(cache, dict) else {}
+    # keep only well-formed entries of wallets that still validate
+    current = set(wallets)
+    good = {}
+    for w, e in cache.items():
+        if w in current and isinstance(e, dict) and INT(e.get("t")) is not _BAD and e["t"] <= now:
+            rec = clean(dict({k: e.get(k) for k in BALANCE if k != "wallet"}, wallet=w), BALANCE)
+            if rec is not _BAD and set(rec) == set(BALANCE) and \
+                    all(rec.get(k) is not None for k in BALANCE) and now - e["t"] <= BALANCE_MAX_AGE_S:
+                good[w] = dict({k: rec[k] for k in ("balance", "vesting", "earned", "blocks")}, t=e["t"])
+    cache = good
+    due = sorted(wallets, key=lambda w: (cache[w]["t"] if w in cache else -1, w))
+    started, fails = clock(), 0
+    for w in due[:BALANCE_FETCHES]:
+        if fails >= 3 or clock() - started > BALANCE_BUDGET_S:
+            break
+        try:
+            b = fetch(api, w)
+        except RouteMissing:
+            return None                # older node: no route (the state is left as it was)
+        except Exception:              # timeout, network, JSON: kept from the cache this run
+            fails += 1
+            continue
+        fails = 0
+        if b is not None:
+            cache[w] = dict(b, t=int(clock()))
+    state["balances"] = cache
+    if not cache:
+        return None                    # nothing known yet (no list, or every fetch failed)
+    accounts = []
+    for w in wallets:
+        e = cache.get(w)
+        if e is None:
+            continue
+        if e["blocks"] == 0 and all(int(e[k]) == 0 for k in ("balance", "vesting", "earned")):
+            continue                   # all zeros: left out (contract)
+        accounts.append({"wallet": w, "balance": e["balance"], "vesting": e["vesting"],
+                         "earned": e["earned"], "blocks": e["blocks"]})
+    accounts.sort(key=lambda x: (-int(x["earned"]), -int(x["balance"]), x["wallet"]))
+    oldest = min((cache[x["wallet"]]["t"] for x in accounts), default=None)
+    return {"as_of_unix": oldest if oldest is not None else min(e["t"] for e in cache.values()),
+            "accounts": accounts}
 
 
 def main():
@@ -1254,7 +1366,9 @@ def main():
     if history:
         write_json(os.path.join(out, "history.json"), history)
     try:
-        awards = build_awards(a.api, chain, state, int(time.time())) if chain else None
+        awards = build_awards(a.api, chain, state, int(time.time()),
+                              [x["wallet"] for x in vals["accounts"]] if vals else None) \
+            if chain else None
     except Exception as e:
         print("awards.json not written: %s" % type(e).__name__, file=sys.stderr)
     if awards:
@@ -1268,12 +1382,14 @@ def main():
 
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):
         print("not published: %s" % what, file=sys.stderr)
-    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s%s%s%s" % (
+    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s%s%s%s%s" % (
         len(index), network.get("latest_certified_day"), len(vals["accounts"]) if vals else 0,
         "%s at height %s" % (chain.get("state"), (chain.get("head") or {}).get("height")) if chain else "-",
         ", wrote day %d" % wrote_day if wrote_day else "",
         ", history %d days" % len(history["days"]) if history else "",
-        ", awards %d days" % len(awards["days"]) if awards else ""))
+        ", awards %d days" % len(awards["days"]) if awards else "",
+        ", balances %d accounts" % len(awards["balances"]["accounts"])
+        if awards and awards.get("balances") else ""))
     return 0
 
 
