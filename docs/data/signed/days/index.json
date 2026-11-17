@@ -1,1 +1,1 @@
-{"alg":"ECDSA-P256-SHA256","format":2,"key":"9fc874c0f34c3d51","name":"days/index.json","payload":"{\"days\":[20770,20771,20772]}","sig":"MEQCIGFi0oP3MGKfLV3iC7ampqEy+ls8UqiGbbTUzrSFBgWTAiBGMnL0fh83iPH+0GMzRjdXVHalpvJqYZsoELGixqk+6A=="}
+{"alg":"ECDSA-P256-SHA256","format":2,"key":"9fc874c0f34c3d51","name":"days/index.json","payload":"{\"days\":[20770,20771,20772,20773]}","sig":"MEUCIESQrV/bx1tDFkzLP2vS6TxjL18cczI0KWQ1WDiSvlr3AiEAkJvQ4hHJOSnej0AZ9xWs0Bck6NY1nin33YNULcDK/3k="}
