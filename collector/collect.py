@@ -484,6 +484,11 @@ def write_json(path, obj):
 BLOCKS_FORM = b"\x01\x01"
 BLOCK_FIXED = 2 + 32 + 32 + 8 + 8 + 4 + 8 + 32 + 32
 BLOCK_DAYS = 7                         # days published, today included
+# Block heights the apps mark as milestones (blocks.json `notable`). A block is listed
+# only while it is inside the walked window (BLOCK_DAYS), so the apps must remember one
+# they have seen: after a week it is no longer in the file.
+NOTABLE_HEIGHTS = frozenset((6529, 10000, 42069, 65290, 69420, 100000, 420000, 1000000))
+NOTABLE = {"height": INT, "wallet": WALLET, "unix": INT}
 STORE_DIRS = (
     "~/Library/Application Support/6529-validator",       # the desktop app, macOS
     "/var/lib/6529-validator",                             # the Linux service
@@ -621,12 +626,22 @@ def chain_blocks(api, roster_wallets, now):
     listed = [w for w in makers if w in known and clean(w, WALLET) is not _BAD]
     if len(listed) * 10 < len(makers) * 9:
         return no("too many block makers are not validating accounts")
+    # Blocks of a notable height in the walk (canonical chain only, final or not, like
+    # the counts). The maker is named by the same rule as `accounts`: only a listed
+    # validating account; any other maker is null.
+    listed_set = set(listed)
+    notable = [{"height": c[2], "wallet": c[5] if c[5] in listed_set else None, "unix": c[4] // 1000}
+               for c in reversed(canon) if c[2] in NOTABLE_HEIGHTS]
+    cleaned = clean(notable, LIST(NOTABLE, len(NOTABLE_HEIGHTS)), "blocks.notable")
+    if cleaned is _BAD or cleaned != notable:
+        return no("a notable block has an unexpected form")
     return {
         "generated_unix": now, "day": day, "head_height": height,
         "days": days, "totals": [sum(per_day[d].values()) for d in days],
         "accounts": [{"wallet": w, "counts": [per_day[d].get(w, 0) for d in days],
                       "today_unix": sorted(times.get(w, []))[-2880:],
                       "last_unix": last.get(w)} for w in listed],
+        "notable": notable,
     }
 
 
@@ -634,7 +649,10 @@ def chain_blocks(api, roster_wallets, now):
 # One JSON file NEXT TO the data directory, never inside it (everything inside the data
 # directory is published). It holds: the handle cache, the last validator list seen for
 # the current day (to write that day's file when the day changes), and the awards days
-# that are settled and final (they no longer change). Losing it costs only a few runs.
+# that are settled and final (they no longer change); also each settled day's award
+# total ("award_totals", for distributed_total) and each account's signed-day counters
+# ("sign_counts"). Losing it costs only a few runs for most of it; those two then fall
+# back to lower bounds (or null), see their sections.
 STATE_VERSION = 1
 
 
@@ -817,6 +835,122 @@ def roll_day(out, state, vals):
     if isinstance(vals.get("cycle_day"), int):
         state["last_vals"] = vals
     return wrote
+
+
+# ---- Signed days and streak per ACCOUNT (validators.json accounts[]) ---------------
+# `signed_days`: the days the account signed (a day counts when ANY of its machines
+# signed it), all days since the network's first day, today included once signed.
+# `streak`: consecutive signed days ending today when the account signed today, else
+# ending yesterday (today, still open, never breaks it; a finished day unsigned resets it).
+#
+# The node gives per MACHINE only `signed_30` (finished days signed in the last 30, NOT
+# today: a machine that signed every day since its first_signed_day shows exactly
+# today - first_signed_day) and first/last_signed_day; the days/ archive starts only on
+# day 20770 while the network started on day 20765. So the collector keeps, in the state
+# file ("sign_counts"), per account: {days, streak, through}, the signed days and the
+# streak counted over the FINISHED days up to and including `through`. It is
+#   - started once from a lower bound read from today's list (sign_lower_bounds): days =
+#     the largest signed_30 of its machines; streak = today - first_signed_day for a
+#     machine "proven" to have signed every day since its first (signed_30 equals that
+#     number; possible only while it is within 30 days), else 1 when a machine's
+#     last_signed_day is yesterday. The network is younger than 30 days (Nov 2026), so
+#     today this bound is the exact figure for an account whose machines cover its days;
+#   - moved on by one day when the day changes, from the previous day's last list: that
+#     day was signed when a machine showed SIGNED, or, in the new list, a machine's
+#     last_signed_day is that day or its signed_30 grew (a late signature after the last
+#     run of the day; signed_30 can only grow by a newly signed day);
+#   - never below the lower bound of the current list (both are lower bounds, so is
+#     their maximum). After a gap (days the collector did not see) the streak restarts
+#     from the lower bound and the days keep the larger of the two.
+# Everything here is a LOWER bound: a missed signature only makes a figure small (a
+# milestone late), never large. Null when the list has no day.
+SIGN_KEEP_DAYS = 60                    # entries of accounts gone this long are forgotten
+
+
+def _machines(a):
+    return [m for m in (a.get("machines") if isinstance(a.get("machines"), list) else [])
+            if isinstance(m, dict)]
+
+
+def _day_signed(a):
+    return any(m.get("today") == "SIGNED" for m in _machines(a))
+
+
+def sign_lower_bounds(a, today):
+    """(days, streak) the account surely signed among the finished days before `today`."""
+    days = streak = 0
+    for m in _machines(a):
+        s30, fs, ls = m.get("signed_30"), m.get("first_signed_day"), m.get("last_signed_day")
+        if _req_int(ls) and ls == today - 1:
+            streak = max(streak, 1)
+        if not (_req_int(s30) and _req_int(fs)) or fs > today or s30 > min(30, today - fs):
+            continue                   # not the counter this was written for: not used
+        days = max(days, s30)
+        if fs < today and s30 == today - fs:
+            streak = max(streak, today - fs)
+    return max(days, streak), streak
+
+
+def account_signing(state, vals):
+    """Set `signed_days` and `streak` on each account of `vals` (see above)."""
+    today = vals.get("cycle_day")
+    accounts = vals.get("accounts") or []
+    if not _req_int(today):
+        for a in accounts:
+            a["signed_days"] = a["streak"] = None
+        return
+    raw = state.get("sign_counts")
+    counts = {}
+    for w, e in (raw.items() if isinstance(raw, dict) else []):
+        if clean(w, WALLET) is not _BAD and w == w.lower() and isinstance(e, dict) \
+                and all(_req_int(e.get(k)) for k in ("days", "streak", "through")) \
+                and e["streak"] <= e["days"] and e["through"] >= today - SIGN_KEEP_DAYS:
+            counts[w] = {k: e[k] for k in ("days", "streak", "through")}
+    # The day changed: count the previous day (final now) once, for each account.
+    prev = state.get("last_vals")
+    if isinstance(prev, dict) and _req_int(prev.get("cycle_day")) and prev["cycle_day"] < today \
+            and isinstance(prev.get("accounts"), list):
+        day = prev["cycle_day"]
+        cur = {a["wallet"].lower(): {m.get("code"): m for m in _machines(a)} for a in accounts}
+        for a in prev["accounts"]:
+            if not isinstance(a, dict) or clean(a.get("wallet"), WALLET) in (_BAD, None):
+                continue
+            w = a["wallet"].lower()
+            e = counts.get(w)
+            if e is None or e["through"] != day - 1:
+                continue               # not started, or a gap: the lower bound below decides
+            now_m = cur.get(w, {})
+            signed = _day_signed(a)
+            for m in _machines(a):
+                n = now_m.get(m.get("code")) or {}
+                # signed_30 growing tells only when no day was skipped in between
+                if n.get("last_signed_day") == day or (
+                        today == day + 1 and _req_int(n.get("signed_30"))
+                        and _req_int(m.get("signed_30")) and n["signed_30"] > m["signed_30"]):
+                    signed = True
+            counts[w] = {"days": e["days"] + (1 if signed else 0),
+                         "streak": e["streak"] + 1 if signed else 0, "through": day}
+    for a in accounts:
+        w = a["wallet"].lower()
+        lb_days, lb_streak = sign_lower_bounds(a, today)
+        e = counts.get(w)
+        if e is not None and e["through"] > today - 1:
+            pub = (lb_days, lb_streak)  # the node went back a day (resync): kept, not used
+        else:
+            if e is None:
+                e = {"days": lb_days, "streak": lb_streak}
+            elif e["through"] == today - 1:
+                e = {"days": max(e["days"], lb_days), "streak": max(e["streak"], lb_streak)}
+            else:                      # days not seen: the streak is not known past them
+                e = {"days": max(e["days"], lb_days), "streak": lb_streak}
+            e["through"] = today - 1
+            counts[w] = e
+            pub = (e["days"], e["streak"])
+        signed_today = 1 if _day_signed(a) else 0
+        days, streak = INT(pub[0] + signed_today), INT(pub[1] + signed_today)
+        a["signed_days"] = None if days is _BAD else days
+        a["streak"] = None if streak is _BAD else streak
+    state["sign_counts"] = counts
 
 
 # ---- history.json (one row per day, oldest first, today last) ----------------------
@@ -1016,6 +1150,36 @@ def award_day(api, summary_row):
     return out
 
 
+# ---- awards.json "distributed_total" (all days since the chain started) -------------
+# The sum of `award_total` over every settled day since the chain's first day, each day
+# counted once. The node's days list covers only the last AWARD_DAYS days, so each
+# settled day's total is kept in the state file ("award_totals", {day: wei string}): a
+# day read again replaces its own value (a settled day that is not yet final may still
+# be corrected), and a day that left the list keeps the value last read for it. The open
+# day pays nothing yet and is not counted. Fail-closed: null unless EVERY day from the
+# chain's start_day to the newest settled day has a value (a gap, for example after the
+# state file was lost for more than AWARD_DAYS days, would make the sum too small), and
+# null when the chain's start_day is unknown.
+def distributed_total(state, days, start_day):
+    kept = state.get("award_totals")
+    kept = {k: v for k, v in kept.items() if k.isdigit() and AMOUNT(v) is not _BAD} \
+        if isinstance(kept, dict) else {}
+    for d in days:
+        if d.get("state") == "settled" and AMOUNT(d.get("award_total")) is not _BAD \
+                and _req_int(d.get("day")):
+            kept[str(d["day"])] = d["award_total"]
+    state["award_totals"] = kept
+    if not _req_int(start_day):
+        return None
+    settled = [int(k) for k in kept if int(k) >= start_day]
+    if not settled:
+        return None
+    if any(str(x) not in kept for x in range(start_day, max(settled) + 1)):
+        return None
+    total = str(sum(int(kept[str(x)]) for x in range(start_day, max(settled) + 1)))
+    return total if AMOUNT(total) is not _BAD else None
+
+
 def _head_recent(chain, now, most_s=120):
     """True when the chain's newest block is at most `most_s` old (a lagging node would
     otherwise publish an empty, fresh-looking `live`)."""
@@ -1090,6 +1254,7 @@ def build_awards(api, chain, state, now, wallets=None):
     state["award_days"] = keep
     if not days:
         return None
+    total = distributed_total(state, days, chain.get("start_day"))
     try:
         live = live_keys(api, chain, now)
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
@@ -1107,6 +1272,7 @@ def build_awards(api, chain, state, now, wallets=None):
         "generated_unix": now,
         "currency": cur.get("symbol"), "decimals": cur.get("decimals"), "test": cur.get("test"),
         "days": days,
+        "distributed_total": total,
         "live": None if (live is None or not _head_recent(chain, now)) else {"as_of_unix": now, "window_s": LIVE_WINDOW_S,
                                            "keys": dict(sorted(live.items()))},
         "balances": balances,
@@ -1309,6 +1475,13 @@ def main():
         # file is written), so a slow api.6529.io can never delay the network data.
         for x in vals["accounts"]:
             x["handle"] = handle_of(state, x["wallet"])
+        try:
+            # before roll_day: it reads the previous run's list (state "last_vals")
+            account_signing(state, vals)
+        except Exception as e:         # never let these two figures stop the run
+            print("signed_days/streak not computed: %s" % type(e).__name__, file=sys.stderr)
+            for x in vals["accounts"]:
+                x["signed_days"] = x["streak"] = None
         write_json(os.path.join(out, "validators.json"), vals)
     previous = {}
     try:

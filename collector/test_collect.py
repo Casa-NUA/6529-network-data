@@ -213,7 +213,8 @@ class Awards(unittest.TestCase):
         st = {}
         a = collect.build_awards("x", CHAIN, st, NOW, [W1, W2])
         self.assertEqual(set(a), {"generated_unix", "currency", "decimals", "test", "days", "live",
-                                  "balances"})
+                                  "balances", "distributed_total"})
+        self.assertIsNone(a["distributed_total"])   # CHAIN has no start_day: not known
         self.assertIsNone(a["balances"])          # no chain/account route here (older node)
         self.assertEqual((a["currency"], a["decimals"], a["test"]), ("$fake6529", 18, True))
         self.assertEqual([d["day"] for d in a["days"]], [20771, 20772])      # newest last
@@ -431,6 +432,198 @@ class SignNames(unittest.TestCase):
                 sign.data_files(root)                                       # a linked days/ is refused
         finally:
             shutil.rmtree(root)
+
+
+class DistributedTotal(unittest.TestCase):
+    def setUp(self):
+        collect._dropped.clear()
+        self.real_get = collect.get
+
+    def tearDown(self):
+        collect.get = self.real_get
+
+    def test_in_awards(self):
+        collect.get = FakeNode(routes())
+        st = {}
+        a = collect.build_awards("x", dict(CHAIN, start_day=20771), st, NOW)
+        self.assertEqual(a["distributed_total"], "300")          # the open day is not counted
+        self.assertEqual(st["award_totals"], {"20771": "300"})
+        collect.get = FakeNode(routes())
+        a = collect.build_awards("x", dict(CHAIN, start_day=20770), {}, NOW)
+        self.assertIsNone(a["distributed_total"])                # day 20770 unknown: a gap
+
+    def test_each_day_once_replaced_and_kept(self):
+        big = str(5 * 10 ** 24)
+        st = {"award_totals": {"20770": big, "x": "1", "20769": "-5"}}
+        days = [{"day": 20771, "state": "settled", "award_total": "300"},
+                {"day": 20772, "state": "open", "award_total": None}]
+        self.assertEqual(collect.distributed_total(st, days, 20770), str(5 * 10 ** 24 + 300))
+        self.assertEqual(set(st["award_totals"]), {"20770", "20771"})     # bad entries dropped
+        # the same day read again replaces its value; 20770 left the API window: kept
+        days = [{"day": 20771, "state": "settled", "award_total": "350"},
+                {"day": 20772, "state": "settled", "award_total": "50"}]
+        self.assertEqual(collect.distributed_total(st, days, 20770), str(5 * 10 ** 24 + 400))
+        self.assertEqual(collect.distributed_total(st, [], 20770), str(5 * 10 ** 24 + 400))
+        self.assertIsNone(collect.distributed_total(st, [], 20769))      # a gap: null, never short
+        self.assertIsNone(collect.distributed_total(st, [], None))
+        self.assertIsNone(collect.distributed_total({}, days[:0], 20770))  # nothing settled yet
+
+
+R = ["0x%040x" % (i + 1) for i in range(10)]        # roster wallets (R[0] plays the node's own)
+OUTSIDER = "0x" + "ee" * 20                          # a block maker not on the roster
+
+
+def block_store(root, heights, maker):
+    """A chain store with blocks 1..heights (one per slot), as read_block_index expects."""
+    import struct
+    start = (NOW // 86400 - 4) * 86400000
+    d = os.path.join(root, "chain", "net", "index")
+    os.makedirs(d)
+    parent = b"\0" * 32
+    with open(os.path.join(d, "blocks.log"), "wb") as f:
+        for h in range(1, heights + 1):
+            t = start + h * 30000
+            r = struct.pack(">Q", h).rjust(32, b"\1")
+            body = (b"\x01\x01" + r + parent + struct.pack(">QQIQ", h, h, t // 86400000, t)
+                    + b"\x09" * 32 + b"\0" * 12 + bytes.fromhex(maker(h)[2:]) + b"extra")
+            f.write(struct.pack(">I", len(body)) + body + b"\0" * 8)
+            parent = r
+    head = {"root": "0x" + parent.hex(), "height": heights, "slot": heights, "time": t}
+    own_today = sum(1 for h in range(1, heights + 1)
+                    if maker(h) == R[0] and (start + h * 30000) // 86400000 == t // 86400000)
+    return start, head, own_today
+
+
+class Notable(unittest.TestCase):
+    def setUp(self):
+        collect._dropped.clear()
+        self.real_get, self.real_dirs = collect.get, collect.STORE_DIRS
+        self.root = tempfile.mkdtemp()
+        collect.STORE_DIRS = (self.root,)
+
+    def tearDown(self):
+        collect.get, collect.STORE_DIRS = self.real_get, self.real_dirs
+        shutil.rmtree(self.root)
+
+    def run_blocks(self, heights, maker):
+        start, head, own_today = block_store(self.root, heights, maker)
+        collect.get = FakeNode({
+            "chain": {"head": head, "start_time": start, "slot_ms": 30000},
+            "chain/me": {"wallet": R[0]}, "awards/days": {"days": []},
+            "awards": {"today": {"day": head["time"] // 86400000, "blocks": own_today},
+                       "as_of": {"height": heights}}})
+        return collect.chain_blocks("x", R, head["time"] // 1000 + 10)
+
+    def test_notable_heights(self):
+        b = self.run_blocks(10100, lambda h: OUTSIDER if h == 6529 else R[h % 10])
+        self.assertIsNotNone(b)
+        self.assertEqual(b["head_height"], 10100)
+        self.assertEqual(b["notable"], [
+            {"height": 6529, "wallet": None, "unix": (b["days"][0] * 86400000 + 6529 * 30000) // 1000},
+            {"height": 10000, "wallet": R[0], "unix": (b["days"][0] * 86400000 + 10000 * 30000) // 1000}])
+        self.assertNotIn(OUTSIDER, json.dumps(b))           # not on the roster: never named
+
+    def test_no_notable(self):
+        b = self.run_blocks(3000, lambda h: R[h % 10])
+        self.assertIsNotNone(b)
+        self.assertEqual(b["notable"], [])
+
+
+class Signing(unittest.TestCase):
+    """signed_days and streak per account: lower-bound start, day roll, gaps."""
+    def setUp(self):
+        collect._dropped.clear()
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.out)
+
+    def run_day(self, st, v):
+        # as main() does: account_signing first, then roll_day keeps the list as last_vals
+        collect.account_signing(st, v)
+        collect.roll_day(self.out, st, v)
+        return {a["wallet"]: (a["signed_days"], a["streak"]) for a in v["accounts"]}
+
+    def m(self, code, today, fs, s30, ls):
+        return machine(code, today=today, first_signed_day=fs, signed_30=s30, last_signed_day=ls)
+
+    def acct(self, wallet, *machines):
+        return {"wallet": wallet, "tdh": 1, "weight": 1, "machines": list(machines)}
+
+    def test_lower_bound_start(self):
+        W4, W5 = "0x" + "d4" * 20, "0x" + "e5" * 20
+        v = vals(20774, [
+            # signed every day since the network's first: 9 finished days + today
+            self.acct(W1, self.m("0000000a", "SIGNED", 20765, 9, 20774)),
+            # missed 2 days, signed yesterday, not yet today
+            self.acct(W2, self.m("0000000b", "NOT_YET", 20765, 7, 20773)),
+            # two machines: the newer one proves 4 days in a row, the older one has more days
+            self.acct(W3, self.m("0000000c", "SIGNED", 20770, 4, 20774),
+                      self.m("0000000d", "MISSED", 20765, 8, 20772)),
+            # a counter larger than the days since the first signature: not used
+            self.acct(W4, self.m("0000000e", "NOT_YET", 20772, 5, 20773)),
+            # first signature today
+            self.acct(W5, self.m("0000000f", "SIGNED", 20774, 0, 20774)),
+        ])
+        self.assertEqual(self.run_day({}, v), {W1: (10, 10), W2: (7, 1), W3: (9, 5),
+                                               W4: (1, 1), W5: (1, 1)})
+
+    def test_day_roll(self):
+        st = {}
+        W4 = "0x" + "d4" * 20
+        day1 = vals(20774, [
+            self.acct(W1, self.m("0000000a", "SIGNED", 20765, 9, 20774)),
+            self.acct(W2, self.m("0000000b", "NOT_YET", 20765, 9, 20773)),    # signs late (23:59)
+            self.acct(W3, self.m("0000000c", "NOT_YET", 20765, 9, 20773)),    # never signs that day
+            self.acct(W4, self.m("0000000d", "NOT_YET", 20765, 9, 20773)),    # signed_30 shows it
+        ])
+        self.assertEqual(self.run_day(st, day1), {W1: (10, 10), W2: (9, 9), W3: (9, 9), W4: (9, 9)})
+        self.assertEqual(self.run_day(st, day1), {W1: (10, 10), W2: (9, 9), W3: (9, 9), W4: (9, 9)})
+        day2 = vals(20775, [
+            self.acct(W1, self.m("0000000a", "NOT_YET", 20765, 10, 20774)),
+            self.acct(W2, self.m("0000000b", "SIGNED", 20765, 10, 20775)),
+            self.acct(W3, self.m("0000000c", "NOT_YET", 20765, 9, 20773)),
+            self.acct(W4, self.m("0000000d", "SIGNED", 20765, 10, 20775)),
+        ])
+        got = self.run_day(st, day2)
+        self.assertEqual(got, {W1: (10, 10),        # today still open: the streak holds
+                               W2: (11, 11),        # late signature (signed_30 grew) + today
+                               W3: (9, 0),          # a finished day unsigned resets the streak
+                               W4: (11, 11)})
+        self.assertEqual(st["sign_counts"][W3], {"days": 9, "streak": 0, "through": 20774})
+        self.assertEqual(self.run_day(st, day2), got)            # the same day again: counted once
+        # a run of the next day without its own last list: 20775 counted once, from day2
+        day3 = vals(20776, [self.acct(w, self.m(c, "NOT_YET", 20765, 11, 20775))
+                            for w, c in ((W1, "0000000a"), (W2, "0000000b"))])
+        got3 = self.run_day(st, day3)
+        self.assertEqual(got3[W2], (11, 11))
+        # W1 showed NOT_YET in day2's last list, but its signed_30 grew from 10 to 11: it
+        # signed 20775 late, so the streak goes on
+        self.assertEqual(got3[W1], (11, 11))
+
+    def test_gap_and_resync(self):
+        st = {}
+        v = vals(20774, [self.acct(W1, self.m("0000000a", "SIGNED", 20765, 9, 20774))])
+        self.run_day(st, v)
+        st["sign_counts"][W1] = {"days": 40, "streak": 40, "through": 20760}   # before a long gap
+        st.pop("last_vals")
+        self.assertEqual(self.run_day(st, v), {W1: (41, 10)})   # days kept, streak from the bound
+        st["sign_counts"][W1] = {"days": 50, "streak": 50, "through": 20780}   # node went back
+        st.pop("last_vals")
+        self.assertEqual(self.run_day(st, v), {W1: (10, 10)})   # the bound is published
+        self.assertEqual(st["sign_counts"][W1]["through"], 20780)              # stored entry kept
+        bad = dict(v, cycle_day=None)
+        collect.account_signing({}, bad)
+        self.assertIsNone(bad["accounts"][0]["signed_days"])
+
+    def test_bad_state_entries_dropped(self):
+        st = {"sign_counts": {W1: {"days": 3, "streak": 9, "through": 20773},    # streak > days
+                              "nope": {"days": 1, "streak": 1, "through": 20773},
+                              W2: {"days": "5", "streak": 1, "through": 20773},
+                              W3: {"days": 5, "streak": 1, "through": 20700}}}   # long gone
+        v = vals(20774, [self.acct(W1, self.m("0000000a", "NOT_YET", 20770, 4, 20773))])
+        self.assertEqual(self.run_day(st, v), {W1: (4, 4)})
+        self.assertEqual(set(st["sign_counts"]), {W1})
 
 
 class HeadRecent(unittest.TestCase):
