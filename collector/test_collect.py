@@ -454,7 +454,8 @@ class DistributedTotal(unittest.TestCase):
 
     def test_each_day_once_replaced_and_kept(self):
         big = str(5 * 10 ** 24)
-        st = {"award_totals": {"20770": big, "x": "1", "20769": "-5"}}
+        st = {"award_totals": {"20770": big, "x": "1", "20769": "-5", "\u00b2": "1", "\uff12": "1"},
+              "award_totals_start": 20770}
         days = [{"day": 20771, "state": "settled", "award_total": "300"},
                 {"day": 20772, "state": "open", "award_total": None}]
         self.assertEqual(collect.distributed_total(st, days, 20770), str(5 * 10 ** 24 + 300))
@@ -464,9 +465,18 @@ class DistributedTotal(unittest.TestCase):
                 {"day": 20772, "state": "settled", "award_total": "50"}]
         self.assertEqual(collect.distributed_total(st, days, 20770), str(5 * 10 ** 24 + 400))
         self.assertEqual(collect.distributed_total(st, [], 20770), str(5 * 10 ** 24 + 400))
-        self.assertIsNone(collect.distributed_total(st, [], 20769))      # a gap: null, never short
-        self.assertIsNone(collect.distributed_total(st, [], None))
+        self.assertIsNone(collect.distributed_total(st, [], None))       # start unknown: null
+        self.assertEqual(st["award_totals_start"], 20770)                # ... and nothing changed
+        st2 = {"award_totals": {"20771": "300"}, "award_totals_start": 20770}
+        self.assertIsNone(collect.distributed_total(st2, [], 20770))     # 20770 missing: a gap
         self.assertIsNone(collect.distributed_total({}, days[:0], 20770))  # nothing settled yet
+
+    def test_new_chain_start_clears(self):
+        st = {"award_totals": {"20770": "100", "20771": "300"}, "award_totals_start": 20770}
+        days = [{"day": 20900, "state": "settled", "award_total": "7"}]
+        self.assertEqual(collect.distributed_total(st, days, 20900), "7")
+        self.assertEqual(st["award_totals"], {"20900": "7"})
+        self.assertEqual(st["award_totals_start"], 20900)
 
 
 R = ["0x%040x" % (i + 1) for i in range(10)]        # roster wallets (R[0] plays the node's own)
@@ -505,10 +515,17 @@ class Notable(unittest.TestCase):
         collect.get, collect.STORE_DIRS = self.real_get, self.real_dirs
         shutil.rmtree(self.root)
 
-    def run_blocks(self, heights, maker):
+    def run_blocks(self, heights, maker, finalized="default"):
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
         start, head, own_today = block_store(self.root, heights, maker)
+        chain = {"head": head, "start_time": start, "slot_ms": 30000}
+        if finalized == "default":
+            finalized = {"height": heights - 2}
+        if finalized is not None:
+            chain["finalized"] = finalized
         collect.get = FakeNode({
-            "chain": {"head": head, "start_time": start, "slot_ms": 30000},
+            "chain": chain,
             "chain/me": {"wallet": R[0]}, "awards/days": {"days": []},
             "awards": {"today": {"day": head["time"] // 86400000, "blocks": own_today},
                        "as_of": {"height": heights}}})
@@ -527,6 +544,20 @@ class Notable(unittest.TestCase):
         b = self.run_blocks(3000, lambda h: R[h % 10])
         self.assertIsNotNone(b)
         self.assertEqual(b["notable"], [])
+
+    def test_only_final_blocks(self):
+        maker = lambda h: R[h % 10]
+        b = self.run_blocks(10001, maker, finalized={"height": 9999})
+        self.assertEqual([n["height"] for n in b["notable"]], [6529])     # 10000 not final yet
+        b = self.run_blocks(10001, maker, finalized={"height": 10000})
+        self.assertEqual([n["height"] for n in b["notable"]], [6529, 10000])
+
+    def test_no_finalized_height_no_field(self):
+        maker = lambda h: R[h % 10]
+        for fin in (None, {"height": "10000"}, {"height": True}, {"height": 99999}, {}):
+            b = self.run_blocks(10001, maker, finalized=fin)
+            self.assertIsNotNone(b, fin)                      # the rest of blocks.json is kept
+            self.assertNotIn("notable", b, fin)               # fail-closed: absent, not guessed
 
 
 class Signing(unittest.TestCase):
@@ -615,6 +646,36 @@ class Signing(unittest.TestCase):
         bad = dict(v, cycle_day=None)
         collect.account_signing({}, bad)
         self.assertIsNone(bad["accounts"][0]["signed_days"])
+
+    def test_stale_today_not_counted(self):
+        # a list where `today` still says SIGNED but last_signed_day is the day before (the
+        # node has not turned the day yet): not a signature of this day
+        st = {}
+        v = vals(20774, [self.acct(W1, self.m("0000000a", "SIGNED", 20765, 9, 20773))])
+        self.assertEqual(self.run_day(st, v), {W1: (9, 9)})
+        # next day: the 20774 list's SIGNED was stale, and nothing else shows 20774 signed
+        v2 = vals(20775, [self.acct(W1, self.m("0000000a", "NOT_YET", 20765, 9, 20773))])
+        self.assertEqual(self.run_day(st, v2), {W1: (9, 0)})
+
+    def test_growth_needs_plausible_counters(self):
+        st = {}
+        day1 = vals(20774, [self.acct(W1, self.m("0000000a", "NOT_YET", 20765, 9, 20773)),
+                            self.acct(W2, self.m("0000000b", "NOT_YET", 20765, 8, 20773)),
+                            self.acct(W3, self.m("0000000c", "NOT_YET", 20765, 9, 20773),
+                                      {"code": None, "today": "NOT_YET", "signed_30": 1})])
+        self.run_day(st, day1)
+        day2 = vals(20775, [
+            # grew, but to more than the days since its first signature: not believed
+            self.acct(W1, self.m("0000000a", "NOT_YET", 20765, 11, 20773)),
+            # grew, but its last signature is before the day: not believed
+            self.acct(W2, self.m("0000000b", "NOT_YET", 20765, 9, 20773)),
+            # a machine without a code is never matched
+            self.acct(W3, self.m("0000000c", "NOT_YET", 20765, 9, 20773),
+                      {"code": None, "today": "NOT_YET", "signed_30": 5})])
+        got = self.run_day(st, day2)
+        self.assertEqual(got[W2], (9, 0))
+        self.assertEqual(got[W3], (9, 0))
+        self.assertEqual(got[W1][1], 0)
 
     def test_bad_state_entries_dropped(self):
         st = {"sign_counts": {W1: {"days": 3, "streak": 9, "through": 20773},    # streak > days
