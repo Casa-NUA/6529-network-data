@@ -434,6 +434,82 @@ class SignNames(unittest.TestCase):
             shutil.rmtree(root)
 
 
+class WorkerBatch(unittest.TestCase):
+    """sign.worker_batch: the POST body for the data Worker (data-worker/)."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        for n in ("network.json", "chain.json", "own.json", "cycles/index.json", "days/index.json",
+                  "cycles/20775.json", "cycles/123.json", "days/20774.json", "days/20773.json"):
+            self.put(n)
+
+    def put(self, name, extra=""):
+        p = os.path.join(self.root, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(json.dumps({"alg": "ECDSA-P256-SHA256", "format": 2, "key": "k", "name": name,
+                                "payload": "{}" + extra, "sig": "s"}, separators=(",", ":")))
+
+    def text(self, name):
+        with open(os.path.join(self.root, name)) as f:
+            return f.read()
+
+    def test_body_order_and_exact_text(self):
+        body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+        self.assertEqual(n, 7)
+        names = ["chain.json", "network.json", "cycles/index.json", "days/index.json",
+                 "cycles/20775.json", "days/20774.json", "days/20773.json"]
+        self.assertEqual(body, "{" + ",".join(json.dumps(x) + ":" + self.text(x) for x in names) + "}")
+        self.assertEqual(sorted(json.loads(body)), sorted(names))   # own.json, cycles/123 left out
+        self.assertEqual(nxt["full_unix"], NOW)
+        self.assertEqual(sorted(nxt["files"]), sorted(names))
+
+    def test_only_changed_then_hourly_full(self):
+        _, nxt, _ = sign.worker_batch(self.root, {}, NOW)
+        self.assertEqual(sign.worker_batch(self.root, nxt, NOW + 60), (None, nxt, 0))
+        self.put("network.json", " ")
+        body, nxt2, n = sign.worker_batch(self.root, nxt, NOW + 120)
+        self.assertEqual((n, list(json.loads(body))), (1, ["network.json"]))
+        self.assertEqual(nxt2["full_unix"], NOW)                    # not a full send
+        body, nxt3, n = sign.worker_batch(self.root, nxt2, NOW + 3600)
+        self.assertEqual((n, nxt3["full_unix"]), (7, NOW + 3600))   # every file once an hour
+        os.unlink(os.path.join(self.root, "days/20773.json"))
+        _, nxt4, _ = sign.worker_batch(self.root, {}, NOW)
+        self.assertNotIn("days/20773.json", nxt4["files"])
+        for bad in (None, [], {"files": [], "full_unix": "x"}):     # a bad record: send everything
+            self.assertEqual(sign.worker_batch(self.root, bad, NOW)[2], 6)
+
+    def test_limits_left_for_next_run(self):
+        for d in range(20700, 20770):
+            self.put("days/%d.json" % d)
+        body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+        days = [x for x in json.loads(body) if x.startswith("days/2")]
+        self.assertEqual(len(days), 60)                              # only the 60 the Worker keeps
+        self.assertEqual(days[0], "days/20774.json")
+        self.assertNotIn("days/20700.json", nxt["files"])
+        old = sign.WORKER_MAX_ENTRIES
+        sign.WORKER_MAX_ENTRIES = 3
+        try:
+            body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+            self.assertEqual(list(json.loads(body)), ["chain.json", "network.json", "cycles/index.json"])
+            body2, _, _ = sign.worker_batch(self.root, nxt, NOW + 60)   # the rest go next run
+            self.assertEqual(list(json.loads(body2)), ["days/index.json", "cycles/20775.json", "days/20774.json"])
+        finally:
+            sign.WORKER_MAX_ENTRIES = old
+        self.put("network.json", " " * (sign.WORKER_MAX_ENTRY + 1))  # too big for the Worker
+        body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+        self.assertNotIn("network.json", json.loads(body))
+        self.assertNotIn("network.json", nxt["files"])
+
+    def test_misnamed_envelope_left_out(self):
+        with open(os.path.join(self.root, "chain.json"), "w") as f:
+            f.write(json.dumps({"name": "network.json"}))
+        body, nxt, _ = sign.worker_batch(self.root, {}, NOW)
+        self.assertNotIn("chain.json", json.loads(body))
+        self.assertNotIn("chain.json", nxt["files"])
+
+
 class DistributedTotal(unittest.TestCase):
     def setUp(self):
         collect._dropped.clear()

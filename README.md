@@ -1,7 +1,9 @@
 # 6529 network data
 
-Public data about the 6529 validator network, collected about every 5 minutes from
-one 6529 Validator node run by Casa NUA and published here as JSON. The mobile app
+Public data about the 6529 validator network, collected every 2 minutes from
+one 6529 Validator node run by Casa NUA and published here as JSON (pushed here at most
+every 5 minutes; the same signed files are served sooner by a Cloudflare Worker, see
+"Data Worker" below). The mobile app
 6529 Validator Monitor reads these files.
 
 ## What this is, and what it is not
@@ -46,19 +48,20 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 
 Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/docs/data/<file>`
 
-Timing: the collector runs every 5 minutes. A commit is made when something other
-than the collection time changed, and otherwise on every run too, since the chain's
-head (`chain.json`, `blocks.json`, `awards.json`) moves all the time: a file here is at most about 5
-minutes old. This makes many small commits; old history may be trimmed from time to
-time, as readers only need the current files.
+Timing (18 Nov 2026): the collector runs every 2 minutes. Each run sends the signed files
+that changed to the data Worker (below). A commit is pushed here only when the last push
+was at least 5 minutes ago and something changed; the chain's head (`chain.json`,
+`blocks.json`, `awards.json`) moves all the time, so with 2-minute runs that is every third run
+(about every 6 minutes). This makes many small commits; old history
+may be trimmed from time to time, as readers only need the current files.
 
-Why not more often than 5 minutes: GitHub serves these raw files through a cache that
+Why GitHub is not pushed more often: GitHub serves these raw files through a cache that
 keeps each file for 5 minutes (`cache-control: max-age=300`). A reader can therefore be
-handed a copy up to 5 minutes old whatever the collector does. Running the collector
-more often would shave little off the delay, because the cache dominates, while adding
-commits. A change in the network usually reaches a reader within about 10 minutes (up
-to 5 for the collector's next run and up to 5 for the cache), and sometimes a little
-more, since the cache can hand out a copy that was already a few minutes old. If the node or
+handed a copy up to 5 minutes old whatever the collector does, so pushing more often would
+shave little off the delay while adding commits. A change in the network usually reaches a
+reader of these raw files within about 11 minutes (up to 6 for the next push and up to 5 for
+the cache), and sometimes a little more. Through the data Worker it is about 2 minutes (the
+collector's next run, plus up to 30 s of client caching). If the node or
 the collector stops, the last files stay as they are: check `generated_unix`, and
 `validators_unix` / `cycle_unix` for the age of those two files.
 
@@ -180,7 +183,21 @@ next to `state/data` and never published. Once, after installing this version, r
 rebuild the past days from this repository's history. It also refuses a repository tree
 that contains links, submodules or git control files. Keep the signing key in the
 collector folder, never in the repository. See the comments in `collector/publish.sh`
-and `collector/casa.nua.6529-network-data.plist`.
+and `collector/casa.nua.6529-network-data.plist`. Besides `state/data`, the collector keeps
+in `state/`: `last-push` (the start time of the run that last pushed, for the 5-minute rule)
+and `worker-posted.json` (a digest of each file the data Worker last accepted, so a run sends
+only what changed, and everything once an hour).
+
+## Data Worker (18 Nov 2026)
+
+The same signed files (`docs/data/signed/<name>`) are also served by a Casa NUA Cloudflare
+Worker, `data-worker/`, at `https://monitor6529-data.casanua.workers.dev/v1/data/<name>`
+(for example `.../v1/data/network.json`, `.../v1/data/days/20774.json`), byte for byte as
+signed. The collector POSTs the files that changed after every run; the Worker accepts them
+only when every envelope verifies with the pinned keys under its own name, and never an
+older one. The apps read the Worker first and these GitHub files when it does not answer;
+they check every signature themselves either way. This repository stays the public archive.
+See `data-worker/README.md`.
 
 ## Contact
 

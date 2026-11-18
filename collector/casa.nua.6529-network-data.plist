@@ -21,9 +21,11 @@
     <key>GIT_TERMINAL_PROMPT</key><string>0</string>
     <key>TZ</key><string>UTC</string>
   </dict>
-  <!-- Every 5 minutes. Not less: GitHub's raw file cache keeps each file for 5 minutes,
-       so a shorter interval would not make the data anyone reads any fresher. -->
-  <key>StartInterval</key><integer>300</integer>
+  <!-- Every 2 minutes (18 Nov 2026). Each run sends the changed signed files to the data
+       Worker (monitor6529-data), which the apps read first; publish.sh pushes to GitHub
+       (archive and fallback, behind a 5-minute raw cache) only when the last push is at
+       least 5 minutes old, so every third run. -->
+  <key>StartInterval</key><integer>120</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>
   <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>

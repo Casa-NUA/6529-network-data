@@ -29,6 +29,13 @@ A file whose text did not change keeps its envelope, so unchanged data makes no 
 commit. Needs the `openssl` command; Python standard library otherwise.
 
     python3 -I sign.py --data /path/outside/any/clone/data --key /path/to/signing-key.pem
+
+With --batch BODY --posted FILE instead of --key, it signs nothing: it writes to BODY the
+POST body for the data Worker (data-worker/, spec 2026-11-18): a JSON object
+{"<name>": <envelope>, ...} holding, as their exact text, the signed files that differ from
+what FILE (the collector's own record, outside state/data) says was last accepted, and writes
+FILE + ".next", the record to keep once the Worker answers 204. Nothing to send: neither is
+written. See worker_batch().
 """
 import argparse
 import base64
@@ -40,6 +47,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 OPENSSL = "/usr/bin/openssl" if os.path.exists("/usr/bin/openssl") else "openssl"
 ALG = "ECDSA-P256-SHA256"
@@ -135,11 +143,111 @@ def write_text(path, text):
     os.chmod(path, 0o644)
 
 
+# The names the data Worker accepts (data-worker/data.js), and how many day files it keeps.
+WORKER_NAMES = (re.compile(r"^(network|validators|blocks|chain|awards|history)\.json$"),
+                re.compile(r"^cycles/(index|[0-9]{5})\.json$"),
+                re.compile(r"^days/(index|[0-9]{5})\.json$"))
+WORKER_KEEP = {"days": 60, "cycles": 40}
+WORKER_MAX_BODY = 5 * 1000 * 1000        # the Worker refuses over 6 MB
+WORKER_MAX_ENTRY = 1900 * 1000           # ... one entry over 2 MB
+WORKER_MAX_ENTRIES = 90                  # ... more than 100 entries
+WORKER_FULL_S = 3600                     # send every file again at least this often
+
+
+def _worker_order(name):
+    m = re.match(r"^(cycles|days)/([0-9]{5})\.json$", name)
+    if m:
+        return (2, -int(m.group(2)), name)       # day files, newest first
+    return (1 if "/" in name else 0, 0, name)    # top-level files, then the index files
+
+
+def worker_batch(signed_root, posted, now):
+    """(body text or None, the next `posted` record, number of files in the body) for one POST
+    to the data Worker.
+
+    `posted` is {"files": {name: sha256 of the envelope last accepted}, "full_unix": time of
+    the last POST that held every file}. A file goes in when its envelope differs from that
+    record, and every file goes in once an hour (so a Worker that lost its data is refilled;
+    the Worker takes the same bytes again as a no-op). Only names the Worker accepts, and only
+    the newest days/cycles it keeps. The Worker stores a batch all or nothing, so what would
+    make it refuse one (too big, too many) is left for the next run instead: top-level files
+    first, then the index files, then the day files newest first."""
+    files = posted.get("files") if isinstance(posted, dict) else None
+    files = files if isinstance(files, dict) else {}
+    full_unix = posted.get("full_unix") if isinstance(posted, dict) else None
+    full_unix = full_unix if isinstance(full_unix, int) else 0
+    full = not (0 <= now - full_unix < WORKER_FULL_S)
+    names = [n for n in data_files(signed_root) if any(r.match(n) for r in WORKER_NAMES)]
+    keep = set()
+    for kind, limit in WORKER_KEEP.items():
+        days = sorted((n for n in names if n.startswith(kind + "/") and n != kind + "/index.json"),
+                      reverse=True)
+        keep.update(days[:limit])
+    names = [n for n in names if "/" not in n or n.endswith("/index.json") or n in keep]
+    names.sort(key=_worker_order)
+    parts, size, nxt = [], 2, {}
+    for name in names:
+        raw = read_regular(os.path.join(signed_root, name))
+        digest = hashlib.sha256(raw).hexdigest()
+        if not full and files.get(name) == digest:
+            nxt[name] = digest
+            continue
+        try:
+            text = raw.decode("utf-8")
+            env = json.loads(text)
+            if not isinstance(env, dict) or env.get("name") != name:
+                raise ValueError
+        except ValueError:
+            continue
+        item = json.dumps(name) + ":" + text
+        if len(raw) > WORKER_MAX_ENTRY or len(parts) >= WORKER_MAX_ENTRIES \
+                or size + len(item.encode("utf-8")) + 1 > WORKER_MAX_BODY:
+            if name in files:
+                nxt[name] = files[name]
+            continue
+        parts.append(item)
+        size += len(item.encode("utf-8")) + 1
+        nxt[name] = digest
+    if not parts:
+        return None, posted, 0
+    # A file left out (too big, unreadable) is not in the record, or keeps its old digest, so
+    # the next run tries it again.
+    return "{" + ",".join(parts) + "}", {"files": nxt, "full_unix": now if full else full_unix}, len(parts)
+
+
+def batch_main(a):
+    root = os.path.abspath(a.data)
+    real_dir(root, "data directory")
+    signed = os.path.join(root, "signed")
+    real_dir(signed, "signed directory")
+    try:
+        with open(a.posted, encoding="utf-8") as f:
+            posted = json.load(f)
+    except (OSError, ValueError):
+        posted = {}
+    body, nxt, count = worker_batch(signed, posted, int(time.time()))
+    if body is None:
+        print("0")
+        return 0
+    write_text(a.batch, body)
+    write_text(a.posted + ".next", json.dumps(nxt, sort_keys=True))
+    print(count)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="the collector's own output directory (outside any clone)")
-    ap.add_argument("--key", required=True, help="EC P-256 private key (PEM), kept outside the repository")
+    ap.add_argument("--key", help="EC P-256 private key (PEM), kept outside the repository")
+    ap.add_argument("--batch", help="write the data Worker's POST body here instead of signing")
+    ap.add_argument("--posted", help="with --batch: the record of what the Worker last accepted")
     a = ap.parse_args()
+    if a.batch:
+        if not a.posted:
+            ap.error("--batch needs --posted")
+        return batch_main(a)
+    if not a.key:
+        ap.error("--key is required")
     root = os.path.abspath(a.data)
     real_dir(root, "data directory")
     out = os.path.join(root, "signed")

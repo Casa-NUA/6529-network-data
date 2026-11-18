@@ -1,0 +1,42 @@
+# 6529 Monitor data relay — a Cloudflare Worker (spec of 18 Nov 2026). See README.md.
+# Stores the latest signed envelope per published file name, in a Durable Object.
+name = "monitor6529-data"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+# No per-version preview URLs: only the one workers.dev address answers.
+preview_urls = false
+
+# The latest envelopes. One instance (idFromName("data")).
+[[durable_objects.bindings]]
+name = "DATA"
+class_name = "DataStore"
+
+# Creates the DataStore class on the first deploy (SQLite-backed storage; only
+# storage.get/put/delete are used). Never edit or remove this entry once deployed: later class
+# changes need a NEW [[migrations]] entry with a new tag.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DataStore"]
+
+# A limit on POSTs per address (6 a minute; the collector sends 1 every 2 minutes). The
+# address is used for this one check and is not stored. namespace_id must be unique in the
+# account: the push relay uses 6529, the live relay 6530 and 6531.
+[[ratelimits]]
+name = "RL"
+namespace_id = "6532"
+simple = { limit = 6, period = 60 }
+
+# A limit on GETs per address. One app refresh reads up to ~10 files; 300 a minute leaves
+# room for many devices behind one address (and for the push relay). A WAF rate limiting rule
+# cannot be set on workers.dev; see README.
+[[ratelimits]]
+name = "RL_GET"
+namespace_id = "6533"
+simple = { limit = 300, period = 60 }
+
+# No request logs kept by the Worker: no IPs, no bodies.
+[observability]
+enabled = false
+
+# No secrets and no vars: the signature is the credential, and the pinned keys are in data.js.

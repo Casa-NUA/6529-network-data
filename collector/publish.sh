@@ -1,6 +1,13 @@
 #!/bin/bash
-# Collect public network data from the local validator and push it when it changed.
-# Usage: publish.sh /path/to/the-publishing-clone   (run every 5 minutes by launchd)
+# Collect public network data from the local validator, send the signed files to the data
+# Worker, and push them to GitHub at most every 5 minutes.
+# Usage: publish.sh /path/to/the-publishing-clone   (run every 2 minutes by launchd)
+#
+# Each run: collect and sign (in this folder's state/data), then POST the signed files that
+# changed to the data Worker (WORKER_URL below; data-worker/ in the repository), then, if the
+# last push was at least 5 minutes ago (state/last-push), commit and push to GitHub, which
+# stays the public archive and the apps' fallback. A failed POST is logged and never stops the
+# run; a git failure never stops the POST (it comes first).
 #
 # INSTALL THIS FOLDER OUTSIDE THE CLONE. This script, collect.py and sign.py must run
 # from a fixed copy (for example ~/Library/Application Support/6529-network-data/),
@@ -24,6 +31,10 @@ REPO="${1:?usage: publish.sh /path/to/the-publishing-clone}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 REPO="$(cd "$REPO" && pwd -P)"
 PY="/usr/bin/python3 -I -B"
+RUN_START=$(date +%s)
+# The data Worker (pinned here; nothing secret is sent: the signatures are the credential).
+WORKER_URL="https://monitor6529-data.casanua.workers.dev/v1/data"
+PUSH_EVERY=300                       # seconds between GitHub pushes, at least
 
 # The fixed copy must be real files, outside the clone and outside any git work tree.
 for f in publish.sh collect.py sign.py; do
@@ -57,6 +68,46 @@ if [ -z "$(git config --local user.name || true)" ] || [ -z "$(git config --loca
   exit 1
 fi
 
+# Collect and sign in our own folder.
+STATE="$HERE/state/data"
+mkdir -p "$STATE"
+find "$STATE" \( -name '*.tmp' -o -name '.DS_Store' \) -type f -delete
+# The collector's own state (handle cache, the day's last validator list, settled award
+# days) sits NEXT TO state/data, never inside it: everything inside state/data is published.
+$PY "$HERE/collect.py" --out "$STATE" --state "$HERE/state/collector-state.json"
+KEY="${SIGNING_KEY:-$HERE/signing-key.pem}"
+if [ -f "$KEY" ]; then
+  $PY "$HERE/sign.py" --data "$STATE" --key "$KEY" >/dev/null
+elif [ -e "$STATE/signed" ]; then
+  echo "refusing: signed files exist but the signing key is missing ($KEY)" >&2; exit 1
+fi
+
+# Send the signed files that changed to the data Worker. sign.py --batch writes the body (each
+# envelope's exact text) and the record to keep if the Worker accepts it (204); the record
+# (state/worker-posted.json) and the body sit next to state/data, never inside it. Short
+# timeouts; any failure is one log line and the run goes on.
+if [ -d "$STATE/signed" ]; then
+  BODY="$HERE/state/worker-body.json"
+  POSTED="$HERE/state/worker-posted.json"
+  rm -f "$BODY" "$POSTED.next"
+  if n="$($PY "$HERE/sign.py" --data "$STATE" --batch "$BODY" --posted "$POSTED" 2>/dev/null)"; then
+    if [ -s "$BODY" ]; then
+      # -q: no ~/.curlrc; https only, no proxy, no redirects followed.
+      code="$(/usr/bin/curl -q -sS --proto '=https' --noproxy '*' --connect-timeout 5 --max-time 25 \
+        -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+        --data-binary "@$BODY" "$WORKER_URL" 2>/dev/null)" || true
+      if [ "$code" = "204" ] && [ -f "$POSTED.next" ]; then
+        mv -f "$POSTED.next" "$POSTED"
+      else
+        echo "worker: POST of $n files failed (${code:-000}) $(date -u +%H:%MZ)"
+      fi
+    fi
+  else
+    echo "worker: no batch built $(date -u +%H:%MZ)"
+  fi
+  rm -f "$BODY" "$POSTED.next"
+fi
+
 "${G[@]}" rebase --abort >/dev/null 2>&1 || true
 "${G[@]}" fetch --quiet origin main
 # The published tree may hold only ordinary files: no links, no submodules, and none
@@ -72,20 +123,6 @@ if grep -i '^docs/' <<<"$names" | grep -qv '^docs/data/'; then
   echo "refusing: origin/main has files under a docs folder outside docs/data/" >&2; exit 1
 fi
 "${G[@]}" reset --quiet --hard origin/main
-
-# Collect and sign in our own folder.
-STATE="$HERE/state/data"
-mkdir -p "$STATE"
-find "$STATE" \( -name '*.tmp' -o -name '.DS_Store' \) -type f -delete
-# The collector's own state (handle cache, the day's last validator list, settled award
-# days) sits NEXT TO state/data, never inside it: everything inside state/data is published.
-$PY "$HERE/collect.py" --out "$STATE" --state "$HERE/state/collector-state.json"
-KEY="${SIGNING_KEY:-$HERE/signing-key.pem}"
-if [ -f "$KEY" ]; then
-  $PY "$HERE/sign.py" --data "$STATE" --key "$KEY" >/dev/null
-elif [ -e "$STATE/signed" ]; then
-  echo "refusing: signed files exist but the signing key is missing ($KEY)" >&2; exit 1
-fi
 
 # Publish a copy of it.
 if [ -L docs ] || [ -L docs/data ]; then
@@ -103,22 +140,24 @@ if [ "$("${G[@]}" ls-files docs/data | sed 's|^docs/data/||' | LC_ALL=C sort)" !
   exit 1
 fi
 
-# network.json, chain.json, blocks.json, history.json and awards.json carry the collection
-# time and the chain's head, so they (and their signed copies) change on every run. Commit only when something else
-# changed, or when the last publication is 4 minutes old, which with 5-minute runs is
-# every run: the apps show the chain's head and each account's latest block, and what
-# matters there is how recent they are. (The limit only stops two runs close together.)
-if "${G[@]}" diff --cached --quiet -- docs/data ':!docs/data/network.json' ':!docs/data/chain.json' \
-     ':!docs/data/blocks.json' ':!docs/data/history.json' ':!docs/data/awards.json' \
-     ':!docs/data/signed/network.json' ':!docs/data/signed/chain.json' \
-     ':!docs/data/signed/blocks.json' ':!docs/data/signed/history.json' ':!docs/data/signed/awards.json'; then
-  last=$("${G[@]}" log -1 --format=%ct -- docs/data/network.json 2>/dev/null || echo 0)
-  if [ $(( $(date +%s) - ${last:-0} )) -lt 240 ]; then   # 240: runs are 5 minutes apart, so every run publishes (Hugo, 15 Nov 2026)
-    "${G[@]}" reset --quiet --hard origin/main
-    exit 0
-  fi
-fi
 "${G[@]}" diff --cached --quiet && exit 0
+
+# GitHub at most every PUSH_EVERY seconds (the Worker already has this run's files). The time
+# is the start of the run that last pushed, kept in state/last-push (next to state/data, never
+# in the clone); with 2-minute runs a push is made every third run (every 6 minutes). Without
+# that file (first run of this version), the last commit of network.json counts.
+LAST_PUSH="$HERE/state/last-push"
+if [ -f "$LAST_PUSH" ] && [ ! -L "$LAST_PUSH" ]; then
+  last="$(head -c 20 "$LAST_PUSH" | tr -cd '0-9' | head -c 12)"
+else
+  last="$("${G[@]}" log -1 --format=%ct -- docs/data/network.json 2>/dev/null || true)"
+fi
+last="${last:-0}"
+if [ "$RUN_START" -ge "$last" ] && [ $(( RUN_START - last )) -lt "$PUSH_EVERY" ]; then
+  "${G[@]}" reset --quiet --hard origin/main
+  exit 0
+fi
 "${G[@]}" -c commit.gpgsign=false commit --quiet --no-verify -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
 "${G[@]}" push --quiet --no-verify origin HEAD:main
+echo "$RUN_START" > "$LAST_PUSH.tmp" && mv -f "$LAST_PUSH.tmp" "$LAST_PUSH"
 echo "pushed $(date -u +%H:%MZ)"
