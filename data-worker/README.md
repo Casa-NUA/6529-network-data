@@ -20,8 +20,8 @@ stored (also a name with a query string) · `429` (`RL_GET`) · `503` if storage
 `405` other method. A `/` in the name may be sent as is or as `%2F`.
 
 Names (the allow-list): `network.json`, `validators.json`, `blocks.json`, `chain.json`,
-`awards.json`, `history.json`, `cycles/index.json`, `cycles/<5 digits>.json`, `days/index.json`,
-`days/<5 digits>.json`.
+`awards.json`, `history.json`, `releases.json` (from 18 Nov 2026), `cycles/index.json`,
+`cycles/<5 digits>.json`, `days/index.json`, `days/<5 digits>.json`.
 
 `POST /v1/data` (collector only), body a JSON object `{"<name>": <envelope>, ...}` (each value is
 the envelope file's exact text; the Worker stores each value's exact bytes from the body) →

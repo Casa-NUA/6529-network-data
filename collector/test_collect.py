@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Offline tests for the schema cleaning of the files added on 15 Nov 2026
-(handles, days/, history.json, awards.json) and for sign.py's accepted names.
+(handles, days/, history.json, awards.json), for sign.py's accepted names, and (18 Nov 2026)
+for 6529's signed release feed (keccak-256, secp256k1 recovery, releases.json) and the
+"6529 agrees" cross-check.
 
 No network and no node: the node's answers are fixtures below.
 
@@ -416,7 +418,8 @@ class SignNames(unittest.TestCase):
     def test_names(self):
         root = tempfile.mkdtemp()
         try:
-            for n in ("network.json", "history.json", "awards.json", "own.json", "days/index.json",
+            for n in ("network.json", "history.json", "awards.json", "releases.json", "releases.json.sig",
+                      "own.json", "days/index.json",
                       "days/20771.json", "days/x.json", "days/20771.json.tmp", "cycles/20771.json",
                       "other/1.json"):
                 p = os.path.join(root, n)
@@ -424,7 +427,7 @@ class SignNames(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("{}")
             self.assertEqual(sign.data_files(root), [
-                "awards.json", "history.json", "network.json", "cycles/20771.json",
+                "awards.json", "history.json", "network.json", "releases.json", "cycles/20771.json",
                 "days/20771.json", "days/index.json"])
             shutil.rmtree(os.path.join(root, "days"))
             os.symlink(os.path.join(root, "cycles"), os.path.join(root, "days"))
@@ -800,6 +803,338 @@ class HeadRecent(unittest.TestCase):
         self.assertTrue(collect._head_recent({"head": {"time": (NOW - 60) * 1000}}, NOW))
         self.assertFalse(collect._head_recent({"head": {"time": (NOW - 600) * 1000}}, NOW))
         self.assertFalse(collect._head_recent({}, NOW))
+
+FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def fixture(name):
+    with open(os.path.join(FIX, name), "rb") as f:
+        return f.read()
+
+
+REAL_FEED = fixture("releases-2026-11-18.json")          # fetched once from 6529.io, 18 Nov 2026
+REAL_SIG = fixture("releases-2026-11-18.json.sig")
+REAL_TDH = json.loads(fixture("tdh_global_history-2026-11-18.json"))["data"]
+
+
+def k1_sign(d, digest, k):
+    """A plain ECDSA secp256k1 signature (r||s, 64 bytes), for the tests only."""
+    z = int.from_bytes(digest, "big")
+    r = collect.k1_mul(k, collect.K1_G)[0] % collect.K1_N
+    s = pow(k, collect.K1_N - 2, collect.K1_N) * (z + r * d) % collect.K1_N
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def sig_file(sig64, key=collect.RELEASES_SIGNER, **extra):
+    d = {"format": 1, "algorithm": "ecdsa-secp256k1-sha256", "key": key,
+         "signature": "0x" + sig64.hex()}
+    d.update(extra)
+    return json.dumps(d).encode()
+
+
+class Crypto(unittest.TestCase):
+    def test_keccak_vectors(self):
+        self.assertEqual(collect.keccak256(b"").hex(),
+                         "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        self.assertEqual(collect.keccak256(b"abc").hex(),
+                         "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
+        # longer than one block (136 bytes), and exactly one block less the padding byte
+        self.assertEqual(len(collect.keccak256(b"a" * 300)), 32)
+        self.assertNotEqual(collect.keccak256(b"a" * 135), collect.keccak256(b"a" * 136))
+
+    def test_addresses(self):
+        self.assertEqual(collect.eth_address(collect.k1_mul(1, collect.K1_G)),
+                         "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf")
+        d = 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318
+        self.assertEqual(collect.eth_address(collect.k1_mul(d, collect.K1_G)),
+                         "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23")
+
+    def test_personal_sign_vector(self):
+        # web3.js documentation: accounts.sign("Some data", 0x4c0883a6…) -> this signature.
+        msg = b"Some data"
+        h = collect.keccak256(b"\x19Ethereum Signed Message:\n" + str(len(msg)).encode() + msg)
+        self.assertEqual(h.hex(), "1da44b586eb0729ff70a73c326926f6ed5a25f5b056e7f47fbc6e58d86871655")
+        sig = bytes.fromhex("b91467e570a6466aa9e9876cbcd013baba02900b8979d43fe208a4a4f339f5fd"
+                            "6007e74cd82e037b800186422fc2da167c747ef045e5d18a5f5d4300f8e1a029")
+        q = collect.k1_recover(int.from_bytes(h, "big"), int.from_bytes(sig[:32], "big"),
+                               int.from_bytes(sig[32:], "big"), 0x1c - 27)
+        self.assertEqual(collect.eth_address(q), "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23")
+        self.assertTrue(collect.k1_signed_by(h, sig, "0x2C7536E3605D9C16a7a3D7b1898e529396a65c23"))
+        self.assertFalse(collect.k1_signed_by(h, sig, collect.RELEASES_SIGNER))
+        bad = bytearray(h)
+        bad[0] ^= 1
+        self.assertFalse(collect.k1_signed_by(bytes(bad), sig, "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"))
+
+    def test_sign_recover_round_trip(self):
+        d = 0x1234567890abcdef
+        digest = collect.keccak256(b"round trip")
+        sig = k1_sign(d, digest, 0xC0FFEE)
+        self.assertTrue(collect.k1_signed_by(digest, sig, collect.eth_address(collect.k1_mul(d, collect.K1_G))))
+
+    def test_out_of_range(self):
+        self.assertIsNone(collect.k1_recover(1, 0, 1, 0))
+        self.assertIsNone(collect.k1_recover(1, collect.K1_N, 1, 0))
+        self.assertIsNone(collect.k1_recover(1, 1, collect.K1_N, 1))
+        self.assertIsNone(collect.k1_recover(1, 5, 5, 2))
+        self.assertFalse(collect.k1_signed_by(b"\0" * 32, b"\0" * 64, collect.RELEASES_SIGNER))
+
+
+class ReleaseFeed(unittest.TestCase):
+    def test_real_feed_verifies(self):
+        feed, sig = collect.verify_release_feed(REAL_FEED, REAL_SIG)
+        self.assertEqual(feed["format"], 1)
+        self.assertEqual(sig, json.loads(REAL_SIG)["signature"].lower())
+
+    def test_real_feed_altered_fails(self):
+        for altered in (REAL_FEED.replace(b"rc.23", b"rc.24", 1), REAL_FEED + b"\n",
+                        REAL_FEED[:-1]):
+            with self.assertRaisesRegex(ValueError, "does not verify"):
+                collect.verify_release_feed(altered, REAL_SIG)
+
+    def test_domain_is_part_of_the_message(self):
+        # the same bytes signed WITHOUT the domain prefix (here by a test key named as 6529's)
+        d = 0xBEEF
+        sig = k1_sign(d, collect.hashlib.sha256(REAL_FEED).digest(), 77)
+        with self.assertRaisesRegex(ValueError, "does not verify"):
+            collect.verify_release_feed(REAL_FEED, sig_file(sig))
+
+    def test_other_key_fails(self):
+        d = 0xBEEF
+        digest = collect.hashlib.sha256(collect.RELEASES_DOMAIN + REAL_FEED).digest()
+        sig = k1_sign(d, digest, 77)
+        with self.assertRaisesRegex(ValueError, "does not verify"):
+            collect.verify_release_feed(REAL_FEED, sig_file(sig))        # claims 6529's key
+        other = collect.eth_address(collect.k1_mul(d, collect.K1_G))
+        with self.assertRaisesRegex(ValueError, "another key"):
+            collect.verify_release_feed(REAL_FEED, sig_file(sig, key=other))   # its own key: never pinned
+
+    def test_sig_file_forms(self):
+        sig = json.loads(REAL_SIG)
+        for bad, why in ((b"nope", "not JSON"), (json.dumps(dict(sig, format=2)).encode(), "format"),
+                         (json.dumps(dict(sig, algorithm="ecdsa-p256-sha256")).encode(), "format"),
+                         (json.dumps(dict(sig, signature=sig["signature"] + "1b")).encode(), "64 bytes"),
+                         (json.dumps(dict(sig, signature=sig["signature"][2:])).encode(), "64 bytes")):
+            with self.assertRaisesRegex(ValueError, why):
+                collect.verify_release_feed(REAL_FEED, bad)
+        with self.assertRaisesRegex(ValueError, "size"):
+            collect.verify_release_feed(b"", REAL_SIG)
+        with self.assertRaisesRegex(ValueError, "size"):
+            collect.verify_release_feed(b" " * (collect.RELEASES_MAX + 1), REAL_SIG)
+        # key spelled in lower case is the same key
+        collect.verify_release_feed(REAL_FEED, json.dumps(dict(sig, key=sig["key"].lower())).encode())
+
+
+class FakeWeb(object):
+    def __init__(self, answers):
+        self.answers, self.calls = dict(answers), []
+
+    def __call__(self, url, most, timeout):
+        self.calls.append(url)
+        a = self.answers.get(url)
+        if isinstance(a, Exception):
+            raise a
+        if a is None:
+            raise OSError("no route")
+        return a
+
+
+class UpdateReleases(unittest.TestCase):
+    def setUp(self):
+        self.out = tempfile.mkdtemp()
+        self.path = os.path.join(self.out, "releases.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.out)
+
+    def web(self, feed=REAL_FEED, sig=REAL_SIG):
+        return FakeWeb({collect.RELEASES_URL: feed, collect.RELEASES_SIG_URL: sig})
+
+    def read(self):
+        return json.loads(self.text())
+
+    def text(self):
+        with open(self.path) as f:
+            return f.read()
+
+    def test_publish_then_rate_limit(self):
+        st, web = {}, self.web()
+        self.assertIsNone(collect.update_releases(self.out, st, NOW, fetch=web))
+        r = self.read()
+        self.assertEqual(set(r), {"source", "signer", "verified_unix", "generated_unix", "feed",
+                                  "feed_sha256", "sig"})
+        self.assertEqual(r["source"], "https://6529.io/validator/releases.json")
+        self.assertEqual(r["signer"], "0xf005f32cb7ecf25566b8cf6685394e0cc694b832")
+        self.assertEqual(r["feed"], json.loads(REAL_FEED))
+        self.assertEqual(r["feed_sha256"], collect.hashlib.sha256(REAL_FEED).hexdigest())
+        self.assertEqual((r["verified_unix"], r["generated_unix"]), (NOW, NOW))
+        self.assertEqual(r["sig"], json.loads(REAL_SIG)["signature"].lower())
+        self.assertEqual(len(web.calls), 2)
+        # not due again before RELEASES_EVERY_S: no request at all
+        self.assertIsNone(collect.update_releases(self.out, st, NOW + 60, fetch=web))
+        self.assertEqual(len(web.calls), 2)
+        collect.update_releases(self.out, st, NOW + collect.RELEASES_EVERY_S, fetch=web)
+        self.assertEqual(len(web.calls), 4)
+        self.assertEqual(self.read()["verified_unix"], NOW + collect.RELEASES_EVERY_S)
+
+    def test_failed_verification_keeps_old_file(self):
+        st = {}
+        collect.update_releases(self.out, st, NOW, fetch=self.web())
+        before = self.text()
+        later = NOW + collect.RELEASES_EVERY_S
+        note = collect.update_releases(self.out, st, later,
+                                       fetch=self.web(feed=REAL_FEED.replace(b"urgent", b"normal", 1)))
+        self.assertIn("NOT published", note)
+        self.assertEqual(self.text(), before)
+        note = collect.update_releases(self.out, st, later * 2, fetch=FakeWeb({}))
+        self.assertIn("fetch failed", note)
+        self.assertEqual(self.text(), before)
+        note = collect.update_releases(self.out, st, later * 3,
+                                       fetch=self.web(sig=urllib_error()))
+        self.assertIn("fetch failed", note)
+        self.assertEqual(self.text(), before)
+
+    def test_never_publishes_unverified(self):
+        note = collect.update_releases(self.out, {}, NOW, fetch=self.web(sig=b"{}"))
+        self.assertIn("NOT published", note)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_older_feed_kept_out(self):
+        st = {}
+        collect.update_releases(self.out, st, NOW, fetch=self.web())
+        r = self.read()
+        r["feed"]["sequence"] += 10        # as if a newer feed had been published before
+        collect.write_json(self.path, r)
+        note = collect.update_releases(self.out, st, NOW + collect.RELEASES_EVERY_S, fetch=self.web())
+        self.assertIn("older", note)
+        self.assertEqual(self.read()["verified_unix"], NOW)
+
+    def test_signed_and_worker_name(self):
+        self.assertTrue(sign.TOP.match("releases.json"))
+        self.assertTrue(any(rx.match("releases.json") for rx in sign.WORKER_NAMES))
+        self.assertFalse(any(rx.match("releases.json.sig") for rx in sign.WORKER_NAMES))
+
+
+def urllib_error():
+    import urllib.error
+    return urllib.error.HTTPError(collect.RELEASES_SIG_URL, 503, "unavailable", {}, None)
+
+
+DAY = 20775                          # 2026-11-18, the date of REAL_TDH's first row
+HEADER_20775 = {"cycle_day": DAY, "cutoff_number": 26438213, "total_tdh": 2168968240}
+CP_20765 = {"day": 20765, "header": {"cutoff_number": 26366423},
+            "history_root": "0xbabbd0c0257b8e0f95e3c1f65459ad1cd03222972187f0f31f97d7c045b3c15d",
+            "history_count": 417891,
+            "cycle_root": "0x66a537635925d4074238e81b80c70d5f40be8e71822924ce1b254e99d9a5dd95",
+            "certificate": {"roster_root": "0x2db9324bdb49861d29d48220b6f9defb2721371d2b740fc5f3b5dff52a09cd6d"}}
+
+
+class CrossCheck(unittest.TestCase):
+    def setUp(self):
+        self.out = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.out, "cycles"))
+        self.cycle(DAY, {"day": DAY, "header": dict(HEADER_20775)})
+        self.calls = 0
+
+    def tearDown(self):
+        shutil.rmtree(self.out)
+
+    def cycle(self, day, rec):
+        collect.write_json(os.path.join(self.out, "cycles", "%d.json" % day), rec)
+
+    def rows(self, rows=None, fail=False):
+        def f():
+            self.calls += 1
+            if fail:
+                raise OSError("down")
+            return REAL_TDH if rows is None else rows
+        return f
+
+    def run_cc(self, st, now=NOW, **kw):
+        return collect.update_crosscheck(self.out, st, DAY, now, fetch_rows=self.rows(**kw))
+
+    def test_ok(self):
+        st = {}
+        r = self.run_cc(st)
+        self.assertEqual(r, {"day": DAY, "cutoff": "ok", "tdh": "ok", "checkpoint": "unknown",
+                             "checked_unix": NOW})
+        self.assertEqual(self.calls, 1)
+        # answered: no more requests that day, whatever the time
+        for i in range(1, 6):
+            self.assertEqual(self.run_cc(st, now=NOW + i * 7200), r)
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(collect.clean(r, collect.CROSSCHECK), r)
+
+    def test_differs(self):
+        self.cycle(DAY, {"day": DAY, "header": dict(HEADER_20775, total_tdh=2168968241)})
+        r = self.run_cc({})
+        self.assertEqual((r["cutoff"], r["tdh"]), ("ok", "differs"))
+        self.cycle(DAY, {"day": DAY, "header": dict(HEADER_20775, cutoff_number=26438212)})
+        r = self.run_cc({})
+        self.assertEqual((r["cutoff"], r["tdh"]), ("differs", "ok"))
+
+    def test_failed_read_is_unknown_never_differs(self):
+        st = {}
+        r = self.run_cc(st, fail=True)
+        self.assertEqual((r["cutoff"], r["tdh"]), ("unknown", "unknown"))
+        for rows in ([], [{"date": "2026-11-17", "block": 1, "total_boosted_tdh": 1}],
+                     [{"date": "2026-11-18", "block": "26438213", "total_boosted_tdh": None}], "x"):
+            r = collect.update_crosscheck(self.out, {}, DAY, NOW, fetch_rows=self.rows(rows=rows))
+            self.assertEqual((r["cutoff"], r["tdh"]), ("unknown", "unknown"), rows)
+
+    def test_rate_limit_and_retries(self):
+        st = {}
+        self.run_cc(st, fail=True)
+        self.run_cc(st, now=NOW + 60, fail=True)                      # too soon: no request
+        self.assertEqual(self.calls, 1)
+        self.run_cc(st, now=NOW + collect.CROSSCHECK_RETRY_S, fail=True)
+        self.run_cc(st, now=NOW + 2 * collect.CROSSCHECK_RETRY_S, fail=True)
+        self.run_cc(st, now=NOW + 3 * collect.CROSSCHECK_RETRY_S, fail=True)   # tries used up
+        self.run_cc(st, now=NOW + 9 * collect.CROSSCHECK_RETRY_S)
+        self.assertEqual(self.calls, collect.CROSSCHECK_TRIES)
+        self.assertEqual(st["crosscheck"]["cutoff"], "unknown")
+        # a new day starts over
+        self.cycle(DAY + 1, {"day": DAY + 1, "header": dict(HEADER_20775, cycle_day=DAY + 1)})
+        r = collect.update_crosscheck(self.out, st, DAY + 1, NOW + 86400, fetch_rows=self.rows())
+        self.assertEqual(self.calls, collect.CROSSCHECK_TRIES + 1)
+        self.assertEqual((r["day"], r["cutoff"]), (DAY + 1, "unknown"))     # no 2026-11-19 row
+
+    def test_no_header_no_request(self):
+        os.unlink(os.path.join(self.out, "cycles", "%d.json" % DAY))
+        r = self.run_cc({})
+        self.assertEqual(self.calls, 0)
+        self.assertEqual((r["cutoff"], r["tdh"], r["checked_unix"]), ("unknown", "unknown", None))
+
+    def test_state_survives_a_json_round_trip(self):
+        st = {}
+        self.run_cc(st)
+        st = json.loads(json.dumps(st))
+        self.run_cc(st, now=NOW + 7200)
+        self.assertEqual(self.calls, 1)
+
+    def releases(self, checkpoints):
+        collect.write_json(os.path.join(self.out, "releases.json"),
+                           {"feed": {"format": 1, "sequence": 1, "checkpoints": checkpoints}})
+
+    def test_checkpoint(self):
+        real = json.loads(REAL_FEED)["checkpoints"]
+        self.assertEqual(collect.check_checkpoints(self.out), "unknown")     # no releases.json
+        self.releases(real)
+        self.assertEqual(collect.check_checkpoints(self.out), "unknown")     # no cycles/20765.json
+        self.cycle(20765, CP_20765)
+        self.assertEqual(collect.check_checkpoints(self.out), "ok")
+        self.assertEqual(self.run_cc({})["checkpoint"], "ok")
+        for key, val in (("history_count", 417892), ("cycle_root", "0x" + "00" * 32)):
+            self.cycle(20765, dict(CP_20765, **{key: val}))
+            self.assertEqual(collect.check_checkpoints(self.out), "differs", key)
+        self.cycle(20765, dict(CP_20765, certificate={"roster_root": "0x" + "11" * 32}))
+        self.assertEqual(collect.check_checkpoints(self.out), "differs")
+        self.cycle(20765, dict(CP_20765, history_root=None))                  # our side incomplete
+        self.assertEqual(collect.check_checkpoints(self.out), "unknown")
+        self.cycle(20765, CP_20765)
+        self.releases(real + ["garbage", 5])                                  # unreadable ones skipped
+        self.assertEqual(collect.check_checkpoints(self.out), "ok")
+        self.releases([real[0].upper().replace("0X", "0x")])                  # hex case does not matter
+        self.assertEqual(collect.check_checkpoints(self.out), "ok")
 
 
 if __name__ == "__main__":

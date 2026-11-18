@@ -26,8 +26,11 @@ awards.json (the chain's per-account awards over the last days, from the node's
 awards/network routes, and which keys proposed or voted in the last 10 minutes; from
 rc.19 also each validating account's balance, vesting and earned total, read in
 rotation from chain/account/<wallet>), and
-adds each account's public 6529 handle (from api.6529.io, the only request that leaves
-this machine) to validators.json. It keeps a small state file NEXT TO the data
+adds each account's public 6529 handle (from api.6529.io) to validators.json. From
+18 Nov 2026 it also republishes 6529's signed release feed as releases.json once its
+signature verifies, and adds network.json `crosscheck` ("6529 agrees", against
+api.6529.io's TDH history and the feed's signed checkpoints). Those three are the only
+requests that leave this machine, all public GETs (see their sections). It keeps a small state file NEXT TO the data
 directory (never inside it): the handle cache, the day's last validator list and the
 award days that are settled, and the last balances read.
 
@@ -38,6 +41,7 @@ Python 3.9+, standard library only.
 """
 import argparse
 import glob
+import hashlib
 import http.client
 import json
 import os
@@ -1415,6 +1419,389 @@ def build_balances(api, state, wallets, fetch=fetch_balance, clock=time.time):
             "accounts": accounts}
 
 
+# ---- 6529's signed release feed (releases.json) --------------------------------------
+# 6529 publishes https://6529.io/validator/releases.json (releases, deadlines and signed
+# checkpoints of the network's history) with a detached signature, releases.json.sig:
+#     {"format": 1, "algorithm": "ecdsa-secp256k1-sha256", "key": "0xf005…B832",
+#      "signature": "0x<r 32 bytes><s 32 bytes>"}
+# The message is SHA-256("6529 Validator releases v1" || 0x00 || the feed's exact bytes),
+# signed with secp256k1 as r||s (no recovery byte). The key is pinned below as its Ethereum
+# address (keccak-256 of the public key, last 20 bytes), so the check is: recover the public
+# key from (r, s) with recovery id 0 or 1, and accept only if one of them has that address.
+# This is the scheme of 6529's own code (frontend lib/validator-page/feedSigningKeys.ts,
+# KMS alias 6529-validator-releases; audit/2026-11-18-data-sources.md), and the real feed
+# of 18 Nov 2026 verifies with it (test fixture). The .sig's own "key" field is only checked
+# to name the pinned key; the key itself is never taken from the network.
+#
+# Only a feed that verifies is republished, as our own releases.json (signed with our
+# envelope like every other file): the source, the signer, when we verified it, the feed
+# as parsed, the SHA-256 of its exact bytes and 6529's signature. A failed fetch or check,
+# or an older feed (lower `sequence`) than the one already published, leaves the previous
+# file as it is and logs one line. Fetched at most every RELEASES_EVERY_S.
+RELEASES_URL = "https://6529.io/validator/releases.json"
+RELEASES_SIG_URL = RELEASES_URL + ".sig"
+RELEASES_SIGNER = "0xf005F32cb7Ecf25566B8Cf6685394e0cC694B832"
+RELEASES_DOMAIN = b"6529 Validator releases v1\x00"
+RELEASES_ALG = "ecdsa-secp256k1-sha256"
+RELEASES_MAX = 64 * 1024            # 6529 caps the feed at 56 KiB
+RELEASES_SIG_MAX = 4096
+RELEASES_EVERY_S = 900
+RELEASES_TIMEOUT_S = 8
+PUBLIC_UA = HANDLE_UA
+
+# Keccak-256 (Ethereum's, the original padding 0x01, not SHA3-256's 0x06).
+_KRC = (0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+        0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+        0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+        0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+        0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008)
+_KROT = ((0, 36, 3, 41, 18), (1, 44, 10, 45, 2), (62, 6, 43, 15, 61), (28, 55, 25, 21, 56),
+         (27, 20, 39, 8, 14))
+_M64 = (1 << 64) - 1
+
+
+def _keccak_f(a):
+    for rc in _KRC:
+        c = [a[x][0] ^ a[x][1] ^ a[x][2] ^ a[x][3] ^ a[x][4] for x in range(5)]
+        d = [c[(x - 1) % 5] ^ (((c[(x + 1) % 5] << 1) | (c[(x + 1) % 5] >> 63)) & _M64)
+             for x in range(5)]
+        a = [[a[x][y] ^ d[x] for y in range(5)] for x in range(5)]
+        b = [[0] * 5 for _ in range(5)]
+        for x in range(5):
+            for y in range(5):
+                r, v = _KROT[x][y], a[x][y]
+                b[y][(2 * x + 3 * y) % 5] = (((v << r) | (v >> (64 - r))) & _M64) if r else v
+        a = [[b[x][y] ^ ((~b[(x + 1) % 5][y]) & b[(x + 2) % 5][y]) for y in range(5)]
+             for x in range(5)]
+        a[0][0] ^= rc
+    return a
+
+
+def keccak256(data):
+    rate = 136
+    msg = bytearray(data) + b"\x01"
+    msg += b"\x00" * (-len(msg) % rate)
+    msg[-1] |= 0x80
+    a = [[0] * 5 for _ in range(5)]
+    for off in range(0, len(msg), rate):
+        for i in range(rate // 8):
+            a[i % 5][i // 5] ^= int.from_bytes(msg[off + 8 * i:off + 8 * i + 8], "little")
+        a = _keccak_f(a)
+    return b"".join(a[i % 5][i // 5].to_bytes(8, "little") for i in range(4))
+
+
+# secp256k1, Jacobian coordinates (verification only: nothing secret, so no constant time).
+K1_P = 2 ** 256 - 2 ** 32 - 977
+K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+K1_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+        0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+
+def _k1_dbl(p):
+    if p is None or p[1] == 0:
+        return None
+    x, y, z = p
+    P = K1_P
+    s = 4 * x * y * y % P
+    m = 3 * x * x % P
+    x3 = (m * m - 2 * s) % P
+    return (x3, (m * (s - x3) - 8 * pow(y, 4, P)) % P, 2 * y * z % P)
+
+
+def _k1_add(p, q):
+    if p is None:
+        return q
+    if q is None:
+        return p
+    P = K1_P
+    x1, y1, z1 = p
+    x2, y2, z2 = q
+    z1s, z2s = z1 * z1 % P, z2 * z2 % P
+    u1, u2 = x1 * z2s % P, x2 * z1s % P
+    s1, s2 = y1 * z2s * z2 % P, y2 * z1s * z1 % P
+    if u1 == u2:
+        return _k1_dbl(p) if s1 == s2 else None
+    h, r = (u2 - u1) % P, (s2 - s1) % P
+    h2 = h * h % P
+    h3 = h * h2 % P
+    x3 = (r * r - h3 - 2 * u1 * h2) % P
+    return (x3, (r * (u1 * h2 - x3) - s1 * h3) % P, h * z1 * z2 % P)
+
+
+def k1_mul(k, point):
+    """k * point (affine (x, y) in, affine out; None is the point at infinity)."""
+    acc, add = None, (point[0], point[1], 1)
+    k %= K1_N
+    while k:
+        if k & 1:
+            acc = _k1_add(acc, add)
+        add = _k1_dbl(add)
+        k >>= 1
+    return _k1_affine(acc)
+
+
+def _k1_affine(p):
+    if p is None:
+        return None
+    x, y, z = p
+    zi = pow(z, K1_P - 2, K1_P)
+    return (x * zi * zi % K1_P, y * zi * zi * zi % K1_P)
+
+
+def k1_recover(z, r, s, recid):
+    """The public key (x, y) whose ECDSA signature (r, s) over the hash z (an int) has recovery
+    id `recid` (0 or 1: the parity of R's y), or None. r >= n (recovery ids 2, 3) never occurs
+    in practice and is not supported."""
+    P, N = K1_P, K1_N
+    if not (1 <= r < N and 1 <= s < N) or recid not in (0, 1):
+        return None
+    alpha = (r * r * r + 7) % P
+    y = pow(alpha, (P + 1) // 4, P)
+    if y * y % P != alpha:
+        return None
+    if y & 1 != recid:
+        y = P - y
+    ri = pow(r, N - 2, N)
+    a = k1_mul(s * ri % N, (r, y))
+    b = k1_mul((-z * ri) % N, K1_G)
+    q = _k1_add(None if a is None else (a[0], a[1], 1), None if b is None else (b[0], b[1], 1))
+    return _k1_affine(q)
+
+
+def eth_address(pub):
+    """The lower-case Ethereum address of a public key (x, y)."""
+    return "0x" + keccak256(pub[0].to_bytes(32, "big") + pub[1].to_bytes(32, "big"))[12:].hex()
+
+
+def k1_signed_by(digest, sig64, address):
+    """True when the 64-byte r||s signature over the 32-byte digest is by `address`."""
+    if len(digest) != 32 or len(sig64) != 64:
+        return False
+    z = int.from_bytes(digest, "big")
+    r, s = int.from_bytes(sig64[:32], "big"), int.from_bytes(sig64[32:], "big")
+    for recid in (0, 1):
+        q = k1_recover(z, r, s, recid)
+        if q is not None and eth_address(q) == address.lower():
+            return True
+    return False
+
+
+_SIG_HEX = re.compile(r"^0x[0-9a-fA-F]{128}$")
+
+
+def verify_release_feed(feed_raw, sig_raw):
+    """(the parsed feed, the signature as 0x + 128 lower-case hex) when sig_raw is 6529's valid
+    signature over the exact bytes feed_raw by the pinned key; raises ValueError (why) if not."""
+    if not isinstance(feed_raw, bytes) or not 0 < len(feed_raw) <= RELEASES_MAX:
+        raise ValueError("feed size")
+    try:
+        sig = json.loads(sig_raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise ValueError("signature file is not JSON")
+    if not isinstance(sig, dict) or sig.get("format") != 1 or sig.get("algorithm") != RELEASES_ALG:
+        raise ValueError("unsupported signature format")
+    if not isinstance(sig.get("key"), str) or sig["key"].lower() != RELEASES_SIGNER.lower():
+        raise ValueError("signature names another key")
+    hx = sig.get("signature")
+    if not isinstance(hx, str) or not _SIG_HEX.match(hx):
+        raise ValueError("signature is not 64 bytes of hex")
+    digest = hashlib.sha256(RELEASES_DOMAIN + feed_raw).digest()
+    if not k1_signed_by(digest, bytes.fromhex(hx[2:]), RELEASES_SIGNER):
+        raise ValueError("signature does not verify")
+    try:
+        feed = json.loads(feed_raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise ValueError("signed feed is not JSON")
+    if not isinstance(feed, dict) or feed.get("format") != 1 or INT(feed.get("sequence")) is _BAD:
+        raise ValueError("signed feed of an unknown format")
+    return feed, hx.lower()
+
+
+def fetch_public(url, most, timeout):
+    """The body of a public GET (no proxy, no redirect, at most `most` bytes); raises on any
+    failure (network, HTTP status other than 200, too large)."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": PUBLIC_UA})
+    with OPENER.open(req, timeout=timeout) as r:
+        if r.status != 200:
+            raise ValueError("HTTP %s" % r.status)
+        body = r.read(most + 1)
+    if len(body) > most:
+        raise ValueError("answer too large")
+    return body
+
+
+def FEED(v):  # 6529's own signed feed, republished as parsed once its signature verified
+    return v if isinstance(v, dict) and v.get("format") == 1 and INT(v.get("sequence")) is not _BAD else _BAD
+
+
+RELEASES_FILE = {
+    "source": RE(r"^https://6529\.io/validator/releases\.json$"),
+    "signer": WALLET, "verified_unix": INT, "generated_unix": INT, "feed": FEED,
+    "feed_sha256": RE(r"^[0-9a-f]{64}$"), "sig": RE(r"^0x[0-9a-f]{128}$"),
+}
+
+
+def _read_own(path):
+    try:
+        with open(path) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else None
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def update_releases(out, state, now, fetch=fetch_public):
+    """Fetch, verify and republish 6529's release feed when due (see above). Returns a short
+    log line, or None when nothing was due."""
+    path = os.path.join(out, "releases.json")
+    st = state.get("releases")
+    st = st if isinstance(st, dict) else {}
+    last = INT(st.get("t"))
+    if last is not _BAD and 0 <= now - last < RELEASES_EVERY_S:
+        return None
+    state["releases"] = st
+    st["t"] = now
+    try:
+        feed_raw = fetch(RELEASES_URL, RELEASES_MAX, RELEASES_TIMEOUT_S)
+        sig_raw = fetch(RELEASES_SIG_URL, RELEASES_SIG_MAX, RELEASES_TIMEOUT_S)
+    except Exception as e:             # network, HTTP, too large: keep the previous file
+        return "releases.json: fetch failed (%s), previous file kept" % type(e).__name__
+    try:
+        feed, sig = verify_release_feed(feed_raw, sig_raw)
+    except ValueError as e:
+        return "releases.json: NOT published, %s; previous file kept" % e
+    old_feed = (_read_own(path) or {}).get("feed")
+    old_seq = INT(old_feed.get("sequence")) if isinstance(old_feed, dict) else _BAD
+    if old_seq is not _BAD and feed["sequence"] < old_seq:
+        return "releases.json: verified feed is older (sequence %d < %d), previous file kept" % (
+            feed["sequence"], old_seq)
+    rec = clean({"source": RELEASES_URL, "signer": RELEASES_SIGNER.lower(), "verified_unix": now,
+                 "generated_unix": now, "feed": feed,
+                 "feed_sha256": hashlib.sha256(feed_raw).hexdigest(), "sig": sig},
+                RELEASES_FILE, "releases")
+    if rec is _BAD or len(rec) != len(RELEASES_FILE):
+        return "releases.json: does not fit the schema, previous file kept"
+    write_json(path, rec)
+    st["sequence"] = feed["sequence"]
+    return None
+
+
+# ---- "6529 agrees": our cycle against 6529's own public numbers -------------------------
+# Two independent checks of what this node publishes, shown in network.json `crosscheck`:
+#  - cutoff / tdh: today's cycle header (cutoff_number, total_tdh) against api.6529.io's TDH
+#    history row for the same UTC date (`block`, `total_boosted_tdh`): 6529's TDH run that the
+#    validators' cycle is built on. One small request (CROSSCHECK_URL), at most
+#    CROSSCHECK_TRIES per cycle day and CROSSCHECK_RETRY_S apart, and none once the day has an
+#    answer; remembered in the collector's state.
+#  - checkpoint: every checkpoint in 6529's signed feed (our verified releases.json),
+#    "day:cutoff_number:history_root:history_count:cycle_root:roster_root", against our
+#    cycles/<day>.json. Local, every run.
+# Each is "ok", "differs" or "unknown". "unknown" whenever 6529's side could not be read or
+# has nothing for that day yet (or our side is missing): a failed read is never "differs".
+CROSSCHECK_URL = "https://api.6529.io/api/tdh_global_history?page_size=3"
+CROSSCHECK_TRIES = 3
+CROSSCHECK_RETRY_S = 3600
+CROSSCHECK_MAX = 64 * 1024
+VERDICT = RE(r"^(ok|differs|unknown)$")
+CROSSCHECK = {"day": INT, "cutoff": VERDICT, "tdh": VERDICT, "checkpoint": VERDICT,
+              "checked_unix": INT}
+_CHECKPOINT = re.compile(r"^([0-9]{1,6}):([0-9]{1,12}):(0x[0-9a-fA-F]{64}):([0-9]{1,12}):"
+                         r"(0x[0-9a-fA-F]{64}):(0x[0-9a-fA-F]{64})$")
+
+
+def _verdict(ours, theirs):
+    if INT(ours) is _BAD or INT(theirs) is _BAD:
+        return "unknown"
+    return "ok" if ours == theirs else "differs"
+
+
+def compare_tdh(header, rows, day):
+    """(cutoff, tdh) verdicts for cycle `day` from 6529's TDH history rows."""
+    date = time.strftime("%Y-%m-%d", time.gmtime(day * 86400))
+    row = None
+    if isinstance(rows, list):
+        for r in rows:
+            if isinstance(r, dict) and r.get("date") == date:
+                row = r
+                break
+    if not isinstance(header, dict) or row is None:
+        return "unknown", "unknown"
+    return (_verdict(header.get("cutoff_number"), row.get("block")),
+            _verdict(header.get("total_tdh"), row.get("total_boosted_tdh")))
+
+
+def fetch_tdh_rows(fetch=fetch_public):
+    d = json.loads(fetch(CROSSCHECK_URL, CROSSCHECK_MAX, HANDLE_TIMEOUT_S).decode("utf-8"))
+    rows = d.get("data") if isinstance(d, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("unexpected answer")
+    return rows
+
+
+def check_checkpoints(out):
+    """Our cycle files against the checkpoints in our verified releases.json."""
+    rel = _read_own(os.path.join(out, "releases.json"))
+    feed = rel.get("feed") if rel else None
+    cps = feed.get("checkpoints") if isinstance(feed, dict) else None
+    if not isinstance(cps, list):
+        return "unknown"
+    seen_ok = False
+    for cp in cps:
+        m = _CHECKPOINT.match(cp) if isinstance(cp, str) else None
+        if not m:
+            continue
+        day = int(m.group(1))
+        c = _read_own(os.path.join(out, "cycles", "%d.json" % day))
+        if not c:
+            continue
+        ours = ((c.get("header") or {}).get("cutoff_number"), c.get("history_root"),
+                c.get("history_count"), c.get("cycle_root"),
+                (c.get("certificate") or {}).get("roster_root"))
+        if any(x is None for x in ours):
+            continue
+        theirs = (int(m.group(2)), m.group(3).lower(), int(m.group(4)), m.group(5).lower(),
+                  m.group(6).lower())
+        ours = tuple(x.lower() if isinstance(x, str) else x for x in ours)
+        if ours != theirs:
+            return "differs"
+        seen_ok = True
+    return "ok" if seen_ok else "unknown"
+
+
+def update_crosscheck(out, state, today, now, fetch_rows=fetch_tdh_rows):
+    """network.json's `crosscheck` for cycle day `today` (see above), calling 6529 only when
+    due. Never raises for a failed read."""
+    st = state.get("crosscheck")
+    if not isinstance(st, dict) or st.get("day") != today:
+        st = {"day": today, "cutoff": "unknown", "tdh": "unknown", "tries": 0, "t": None,
+              "checked_unix": None}
+    for k in ("cutoff", "tdh"):
+        if VERDICT(st.get(k)) is _BAD:
+            st[k] = "unknown"
+    tries = INT(st.get("tries"))
+    tries = 0 if tries is _BAD else tries
+    last = INT(st.get("t"))
+    header = (_read_own(os.path.join(out, "cycles", "%d.json" % today)) or {}).get("header")
+    answered = st["cutoff"] != "unknown" and st["tdh"] != "unknown"
+    due = (not answered and tries < CROSSCHECK_TRIES
+           and (last is _BAD or not 0 <= now - last < CROSSCHECK_RETRY_S)
+           and isinstance(header, dict) and INT(header.get("cutoff_number")) is not _BAD)
+    if due:
+        st["tries"], st["t"] = tries + 1, now
+        try:
+            rows = fetch_rows()
+        except Exception:              # network, HTTP, JSON: unknown, try again later
+            rows = None
+        cutoff, tdh = compare_tdh(header, rows, today)
+        st["cutoff"], st["tdh"], st["checked_unix"] = cutoff, tdh, now
+    state["crosscheck"] = st
+    res = clean({"day": today, "cutoff": st["cutoff"], "tdh": st["tdh"],
+                 "checkpoint": check_checkpoints(out),
+                 "checked_unix": st.get("checked_unix")}, CROSSCHECK, "crosscheck")
+    return None if res is _BAD else res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="site data directory")
@@ -1535,6 +1922,10 @@ def main():
     # Only meaningful for the day it was written for: a new day starts without a file.
     net["cycle_unix"] = age("cycle_unix", wrote_today_cycle) \
         if (wrote_today_cycle or previous.get("today") == today) else None
+    # The "6529 agrees" check as last computed (refreshed at the end of the run, after every
+    # file is written, so a slow 6529 never delays the network data).
+    cc = clean(previous.get("crosscheck"), CROSSCHECK, "network.crosscheck")
+    net["crosscheck"] = cc if (cc is not _BAD and cc and cc.get("day") == today) else None
     write_json(os.path.join(out, "network.json"), net)
 
     # The 6529 chain (rc.16+). Optional: older nodes have no /chain.
@@ -1586,6 +1977,21 @@ def main():
             update_handles(state, [x["wallet"].lower() for x in vals["accounts"]], int(time.time()))
         except Exception as e:         # never let the handles stop the run
             print("handles not updated: %s" % type(e).__name__, file=sys.stderr)
+    # 6529's signed release feed, then the "6529 agrees" check (see their sections). Each only
+    # ever leaves its own output as it was when something fails.
+    try:
+        note = update_releases(out, state, int(time.time()))
+        if note:
+            print(note, file=sys.stderr)
+    except Exception as e:
+        print("releases.json not updated: %s" % type(e).__name__, file=sys.stderr)
+    try:
+        cc = update_crosscheck(out, state, today, int(time.time()))
+        if cc != net.get("crosscheck"):
+            net["crosscheck"] = cc
+            write_json(os.path.join(out, "network.json"), net)
+    except Exception as e:
+        print("crosscheck not updated: %s" % type(e).__name__, file=sys.stderr)
     save_state(state_path, state)
 
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):

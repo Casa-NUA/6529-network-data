@@ -81,11 +81,11 @@ await assert.rejects(verifyEnvelope(otherNet, "network.json", PINS), /unknown ke
 await assert.rejects(verifyEnvelope(await signed("network.json", { generated_unix: NOW }), "network.json"), /unknown key/);
 ok.push("unpinned keys are refused by the verifier");
 for (const n of ["network.json", "validators.json", "blocks.json", "chain.json", "awards.json", "history.json",
-  "cycles/20775.json", "cycles/index.json", "days/index.json", "days/20774.json"]) assert.ok(allowed(n), n);
-for (const n of ["live.json", "own.json", "signed/network.json", "../network.json", "/network.json", "network.json/",
+  "releases.json", "cycles/20775.json", "cycles/index.json", "days/index.json", "days/20774.json"]) assert.ok(allowed(n), n);
+for (const n of ["live.json", "own.json", "releases.json.sig", "Releases.json", "releases.json/", "signed/releases.json", "signed/network.json", "../network.json", "/network.json", "network.json/",
   "days/1.json", "days/207740.json", "days/x.json", "cycles/2077.json", "days/20774.json.tmp", "Network.json",
   "days/index2.json", "days\\20774.json", "network.json\n", "", "cycles/20775.JSON"]) assert.ok(!allowed(n), JSON.stringify(n));
-ok.push("name allow-list: the 10 published kinds yes, look-alikes no");
+ok.push("name allow-list: the 11 published kinds yes (releases.json included), look-alikes no");
 
 // ---- 2. the real files, through the production handler ----------------------------------
 await check("GET before the first publish = 404", await GET("network.json"), 404);
@@ -294,6 +294,15 @@ await check("storage failure = 503", await POST(body([["chain.json", failing]]))
 storage.put = savedPut;
 assert.equal(await text("chain.json"), chainNext); ok.push("a failed write changes nothing");
 await check("then the same POST = 204", await POST(body([["chain.json", failing]])), 204);
+
+// ---- releases.json (our republished copy of 6529's verified release feed) -----------------
+NOW += 10;
+const rel1 = await signed("releases.json", { generated_unix: NOW, verified_unix: NOW, source: "https://6529.io/validator/releases.json", feed: { format: 1, sequence: 2 } });
+await check("releases.json with a new network.json = 204", await POST(body([await net(), ["releases.json", rel1]])), 204);
+assert.equal(await text("releases.json"), rel1); ok.push("GET releases.json is byte for byte");
+await check("an older releases.json = 409", await POST(body([await net(), ["releases.json", await signed("releases.json", { generated_unix: NOW - 100, feed: { format: 1, sequence: 1 } })]])), 409);
+await check("releases.json signed as network.json = 403", await POST(body([["releases.json", await signed("releases.json", { generated_unix: NOW + 1 }, TEST, { as: "network.json" })]])), 403);
+assert.equal(await text("releases.json"), rel1); ok.push("refused releases.json changed nothing");
 
 console.log(ok.map((x) => "ok  " + x).join("\n"));
 console.log(`\n${ok.length} checks passed`);

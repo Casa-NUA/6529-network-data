@@ -13,7 +13,7 @@ every 4 minutes; the same signed files are served sooner by a Cloudflare Worker,
 - Most values are things every validator node receives from the network: cycle
   headers, roots, certificate summaries, the validator list. A few are this node's
   **own observations** and will differ slightly between nodes: `strong_unix`,
-  `finalized_unix`, `compare`, `dual_run`, and everything in `chain.json`,
+  `finalized_unix`, `compare`, `dual_run`, `network.json`'s `crosscheck`, and everything in `chain.json`,
   `blocks.json` and `awards.json`.
 - The files do not include the validators' own signatures, so a certificate cannot be
   verified from this data alone. To check it, compare with your own node (below).
@@ -34,7 +34,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 
 | File | What it is |
 |---|---|
-| `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
+| `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster), and `crosscheck` (from 18 Nov 2026; see "6529 agrees" below): `day`, `cutoff`, `tdh` and `checkpoint`, each `ok`, `differs` or `unknown`, and `checked_unix` (when 6529's numbers were last read, `null` if not yet that day); `null` until the first check of the day. |
 | `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). Each account also has `handle`: its public 6529 profile name, from 6529's public API (`api.6529.io`), or `null` when it has none or it has not been looked up yet. Each account also has `signed_days` (the days the account signed, a day counting when any of its machines signed it, since the network's first day, today included once signed) and `streak` (consecutive signed days ending today if the account signed today, else ending yesterday; a finished day without a signature resets it to 0). Both are lower bounds kept by the collector from day to day (started from the machines' `signed_30` and `first_signed_day`), so they can be too small, never too large; `null` when unknown. `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
 | `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run (every 2 minutes, to the data Worker), pushed here every 4 minutes. |
 | `docs/data/blocks.json` | Who made (proposed) the 6529 chain's blocks, on the collecting node's current chain, for up to 7 chain days: `day` (the UTC day of the head block), `head_height`, `days` (day numbers, oldest first; a day starts at `day * 86400` UTC), `totals` (blocks per day, all makers) and `accounts`: per wallet, `counts` (its blocks per day, same order), `today_unix` (the slot time of each block it made today) and `last_unix` (the slot time of its latest block in those days). Only accounts that made a block in those days are listed; a maker that is not a validating account today is counted in `totals` but not listed. Counts are blocks proposed, not votes, and include blocks not yet final, so a count can drop after a reorganisation. `notable`: the FINAL blocks (height at most the chain's finalized height) of a notable height (6529, 10000, 42069, 65290, 69420, 100000, 420000, 1000000) among the blocks read, as `height`, `wallet` (the maker when it is a listed validating account, else `null`) and `unix` (its slot time); an empty list when there is none (a block drops out of the list with its day); the field is absent when the finalized height could not be read. Read from the node's chain store (see "Run it yourself"). |
@@ -42,6 +42,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 | `docs/data/days/index.json` | `{"days": [...]}`: the days that have a file, oldest first. Today is never listed (it is `validators.json`). |
 | `docs/data/history.json` | Network growth, one row per day, oldest first, the last row being today so far: `day`, `validators` and `signed` (machines listed, and machines that signed, at the day's end), `accounts` and `accounts_signed`, `w`, `continents` (machines per self-declared continent, `UNKNOWN` when none) and `software` (machines per self-declared version, `UNKNOWN` when none). Built from the day files and today's list; `generated_unix` is the collection time. |
 | `docs/data/awards.json` | The 6529 chain's awards (test currency), from the collecting node's `awards/network` routes (validator rc.18 and later): `currency`, `decimals`, `test`, and `days`, the last up to 7 chain days, newest last: `day`, `state` (`open` or `settled`), `final`, `slots`, `blocks` (the day's blocks), `award_total` (what the chain paid for the day; `null` until it settles, the next morning), `recorded` and `accounts`. Per account (`wallet`; an account with several keys is summed over them): `blocks` and `votes` (blocks it proposed and votes it cast that day, `null` when unknown) and `award` (`total`, `blocks_part`, `votes_part`, `null` for an open day). Amounts are decimal strings in the smallest unit (18 decimals). **`blocks` and `votes` count only what the collecting node recorded**: `recorded.blocks` / `recorded.votes` say `all`, `part` (it saw only part of the day, for example because it started during it) or `none` (then they are `null`). Awards are the chain's own figures, whatever the node recorded. An account with no block, no vote and nothing paid that day is left out. `live`: `as_of_unix`, `window_s` (600) and `keys`: every machine key code (as in `validators.json`) that proposed or voted in a block in the last `window_s` seconds before `as_of_unix`, with the time of its newest such block; `null` when the node recorded no blocks then. Per-account `blocks` and `votes` are published only for days the collecting node recorded in full (`recorded` = `all`); otherwise null. `live` is null when the routes cannot be read, when the node recorded no blocks in the window, or when the chain's newest block is more than 2 minutes old. `balances` (validator rc.19 and later, from the node's `chain/account/<wallet>` route, which answers the same for any account): `as_of_unix` and `accounts`, one row per validating account in `validators.json`: `wallet`, `balance` (what the account can send now), `vesting` (awarded but still vesting), `earned` (everything the chain has awarded it, all days) and `blocks` (blocks it proposed, all days), amounts as decimal strings in the smallest unit (18 decimals), like the awards. An account whose four figures are all zero is left out. The accounts are read in rotation, up to 80 per run (each run reads first the ones read longest ago), so a row can be some minutes older than the file: `as_of_unix` is the time of the OLDEST read among the rows shown. An account that leaves `validators.json` is dropped, and a row that could not be read again for an hour is no longer shown. Balances change every morning at 00:04 UTC, when the day's vesting part is released (from 18 Nov 2026: what is vesting then, and each new award, is released in equal daily parts over 90 days), and whenever an account sends or receives a transfer. `balances` is null when the node has no such route (older node). `distributed_total`: everything the chain has paid since its first day, the sum of `award_total` over every settled day (kept by the collector after a day leaves `days`), a decimal string in the smallest unit; `null` when a day since the chain's start is missing from that sum. |
+| `docs/data/releases.json` | 6529's own signed release feed (from 18 Nov 2026), republished only after its 6529 signature verified (see "6529's release feed" below): `source` (`https://6529.io/validator/releases.json`), `signer` (6529's feed key, `0xf005f32cb7ecf25566b8cf6685394e0cc694b832`), `verified_unix` and `generated_unix` (when the collector last fetched and verified it, at most every 15 minutes), `feed` (the feed as 6529 published it, parsed: releases, `min_supported`, `deadline`, `checkpoints`, ...), `feed_sha256` (SHA-256 of the exact bytes 6529 signed) and `sig` (6529's signature, `0x` + r‖s in hex). |
 | `docs/data/cycles/<day>.json` | One cycle (day number = days since 1970-01-01 UTC): `state`, `window`, `header`, `cycle_root`, `history_root`, `history_count`, `certificate` (summary: level, weights, counts, roots), `compare`, `dual_run`, `other_roots` (a count), `finalized_unix`. |
 | `docs/data/cycles/index.json` | One summary line per cycle. |
 | `docs/data/signed/<same names>` | The same files, each wrapped with a signature (see "Signatures"). |
@@ -156,8 +157,10 @@ service install). Elsewhere, or if it finds nothing, pass it:
 `--api http://127.0.0.1:<port>/api/v1`. It uses only the Python standard library and
 reads the node's loopback API (`status`, `network`, `cycles/<day>`, `chain`, and from
 rc.18 `awards/network/days`, `awards/network/day/<day>` and
-`awards/network/day/<day>/blocks`). The one request that leaves the machine is the
-handle lookup at `api.6529.io`. For
+`awards/network/day/<day>/blocks`). The requests that leave the machine are the handle
+lookups at `api.6529.io`, 6529's release feed (`6529.io/validator/releases.json` and `.sig`, at
+most every 15 minutes) and the "6529 agrees" check (`api.6529.io/api/tdh_global_history`, at
+most 3 times a day), all public GETs. For
 `blocks.json` it also reads one file of the node's chain store on disk, the index of
 blocks (`chain/<id>/index/blocks.log`: public chain facts), and the node's own block
 count from the API (`chain/me`, `awards`, `awards/days`), which it uses only to check
@@ -187,6 +190,43 @@ and `collector/casa.nua.6529-network-data.plist`. Besides `state/data`, the coll
 in `state/`: `last-push` (the start time of the run that last pushed, for the 4-minute rule)
 and `worker-posted.json` (a digest of each file the data Worker last accepted, so a run sends
 only what changed, and everything once an hour).
+
+## 6529's release feed (18 Nov 2026)
+
+6529 publishes `https://6529.io/validator/releases.json` (releases, the minimum supported version,
+update deadlines and signed checkpoints of the network's history) with a detached signature,
+`releases.json.sig`. The collector fetches both at most every 15 minutes and checks the signature
+the way 6529's validators do: the message is SHA-256 of `"6529 Validator releases v1"`, one zero
+byte and the feed's exact bytes; the signature is secp256k1 `r‖s` (64 bytes); the public key is
+recovered from it and its Ethereum address (keccak-256) must be the pinned
+`0xf005F32cb7Ecf25566B8Cf6685394e0cC694B832`, written into `collect.py` (the key named in the
+`.sig` file is never trusted). Keccak-256 and secp256k1 are implemented in `collect.py` itself
+(standard library only) and tested with known vectors and the real feed of 18 Nov 2026
+(`collector/fixtures/`). Only a feed that verifies, and is not older (by its `sequence`) than the
+one already published, is written as `releases.json`, which then gets this repository's own
+signature like every other file. When the fetch or the check fails, the previous file stays and the
+collector logs one line: an unverified feed is never published. `feed` is 6529's text as parsed,
+so 6529's signature cannot be re-checked from this file alone; `feed_sha256` and `sig` say which
+bytes were verified, and anyone can fetch and check 6529's own copy.
+
+## "6529 agrees" (18 Nov 2026)
+
+`network.json`'s `crosscheck` compares this node's data with 6529's own, for the cycle day `day`:
+
+- `cutoff`: today's cycle `header.cutoff_number` against `block`, and `tdh`: `header.total_tdh`
+  against `total_boosted_tdh`, in 6529's public TDH history row for the same UTC date
+  (`https://api.6529.io/api/tdh_global_history?page_size=3`, the TDH run the validators' cycle is
+  built on). One request, made only once today's cycle header exists, at most 3 times a day and an
+  hour apart, and not again once both have an answer (kept in the collector's state).
+- `checkpoint`: every checkpoint in 6529's signed feed (`releases.json`),
+  `day:cutoff_number:history_root:history_count:cycle_root:roster_root`, against
+  `cycles/<day>.json` (`header.cutoff_number`, `history_root`, `history_count`, `cycle_root`,
+  `certificate.roster_root`). Checked on every run, without any request.
+
+Each is `ok` (the same), `differs` (6529's number is known and is not ours) or `unknown` (6529
+could not be read, has nothing for that day yet, or our side is missing). A failed read is
+always `unknown`, never `differs`. `api.6529.io` is 6529's word over TLS, without a signature; the
+checkpoint is 6529-signed.
 
 ## Data Worker (18 Nov 2026)
 
