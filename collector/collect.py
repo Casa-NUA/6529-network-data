@@ -1435,8 +1435,9 @@ def build_balances(api, state, wallets, fetch=fetch_balance, clock=time.time):
 #
 # Only a feed that verifies is republished, as our own releases.json (signed with our
 # envelope like every other file): the source, the signer, when we verified it, the feed
-# as parsed, the SHA-256 of its exact bytes and 6529's signature. A failed fetch or check,
-# or an older feed (lower `sequence`) than the one already published, leaves the previous
+# as parsed and as its exact text (so anyone can check 6529's signature from our file), the
+# SHA-256 of those bytes and 6529's signature. A failed fetch or check,
+# or an older feed (lower `sequence`) than the newest one ever published, leaves the previous
 # file as it is and logs one line. Fetched at most every RELEASES_EVERY_S.
 RELEASES_URL = "https://6529.io/validator/releases.json"
 RELEASES_SIG_URL = RELEASES_URL + ".sig"
@@ -1590,8 +1591,12 @@ def k1_signed_by(digest, sig64, address):
 _SIG_HEX = re.compile(r"^0x[0-9a-fA-F]{128}$")
 
 
+def _is_one(v):
+    return type(v) is int and v == 1          # not True, not 1.0
+
+
 def verify_release_feed(feed_raw, sig_raw):
-    """(the parsed feed, the signature as 0x + 128 lower-case hex) when sig_raw is 6529's valid
+    """(the parsed feed, its exact text, the signature as 0x + 128 lower-case hex) when sig_raw is 6529's valid
     signature over the exact bytes feed_raw by the pinned key; raises ValueError (why) if not."""
     if not isinstance(feed_raw, bytes) or not 0 < len(feed_raw) <= RELEASES_MAX:
         raise ValueError("feed size")
@@ -1599,7 +1604,7 @@ def verify_release_feed(feed_raw, sig_raw):
         sig = json.loads(sig_raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise ValueError("signature file is not JSON")
-    if not isinstance(sig, dict) or sig.get("format") != 1 or sig.get("algorithm") != RELEASES_ALG:
+    if not isinstance(sig, dict) or not _is_one(sig.get("format")) or sig.get("algorithm") != RELEASES_ALG:
         raise ValueError("unsupported signature format")
     if not isinstance(sig.get("key"), str) or sig["key"].lower() != RELEASES_SIGNER.lower():
         raise ValueError("signature names another key")
@@ -1610,34 +1615,66 @@ def verify_release_feed(feed_raw, sig_raw):
     if not k1_signed_by(digest, bytes.fromhex(hx[2:]), RELEASES_SIGNER):
         raise ValueError("signature does not verify")
     try:
-        feed = json.loads(feed_raw.decode("utf-8"))
+        text = feed_raw.decode("utf-8")
+        feed = json.loads(text)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise ValueError("signed feed is not JSON")
-    if not isinstance(feed, dict) or feed.get("format") != 1 or INT(feed.get("sequence")) is _BAD:
+    if FEED(feed) is _BAD:
         raise ValueError("signed feed of an unknown format")
-    return feed, hx.lower()
+    return feed, text, hx.lower()
 
 
 def fetch_public(url, most, timeout):
     """The body of a public GET (no proxy, no redirect, at most `most` bytes); raises on any
-    failure (network, HTTP status other than 200, too large)."""
+    failure (network, HTTP status other than 200, too large, or more than `timeout` seconds in
+    all: the socket timeout bounds each wait, and the body is read in pieces checked against
+    the same deadline, so a server that trickles bytes cannot hold the run)."""
+    end = time.monotonic() + timeout
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": PUBLIC_UA})
     with OPENER.open(req, timeout=timeout) as r:
         if r.status != 200:
             raise ValueError("HTTP %s" % r.status)
-        body = r.read(most + 1)
-    if len(body) > most:
+        parts, size = [], 0
+        while size <= most:
+            if time.monotonic() > end:
+                raise TimeoutError("too slow")
+            chunk = r.read(min(8192, most + 1 - size))
+            if not chunk:
+                break
+            parts.append(chunk)
+            size += len(chunk)
+    if size > most:
         raise ValueError("answer too large")
-    return body
+    return b"".join(parts)
+
+
+# The releases fetch and the cross-check together get at most PUBLIC_BUDGET_S of wall clock per
+# run (checked before each request; each request's timeout is at most what is left), so a slow
+# 6529 can delay the run, and the signing and upload after it, by that much at most.
+PUBLIC_BUDGET_S = 20
+PUBLIC_MIN_S = 1.0                     # less than this left: the request is not made
+
+
+def _left(deadline, cap):
+    """The timeout for the next request: `cap`, cut to what is left before `deadline`
+    (time.monotonic(); None = no budget); None when too little is left to try."""
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    return min(cap, left) if left >= PUBLIC_MIN_S else None
 
 
 def FEED(v):  # 6529's own signed feed, republished as parsed once its signature verified
-    return v if isinstance(v, dict) and v.get("format") == 1 and INT(v.get("sequence")) is not _BAD else _BAD
+    return v if isinstance(v, dict) and _is_one(v.get("format")) and INT(v.get("sequence")) is not _BAD else _BAD
+
+
+def FEED_TEXT(v):  # the exact text 6529 signed (UTF-8), so anyone can check feed_sha256 and sig
+    return v if isinstance(v, str) and 0 < len(v.encode("utf-8")) <= RELEASES_MAX else _BAD
 
 
 RELEASES_FILE = {
     "source": RE(r"^https://6529\.io/validator/releases\.json$"),
-    "signer": WALLET, "verified_unix": INT, "generated_unix": INT, "feed": FEED,
+    "signer": WALLET, "verified_unix": INT, "generated_unix": INT, "feed": FEED, "feed_text": FEED_TEXT,
     "feed_sha256": RE(r"^[0-9a-f]{64}$"), "sig": RE(r"^0x[0-9a-f]{128}$"),
 }
 
@@ -1651,33 +1688,44 @@ def _read_own(path):
         return None
 
 
-def update_releases(out, state, now, fetch=fetch_public):
-    """Fetch, verify and republish 6529's release feed when due (see above). Returns a short
-    log line, or None when nothing was due."""
+def update_releases(out, state, now, fetch=fetch_public, deadline=None):
+    """Fetch, verify and republish 6529's release feed when due (see above), within the time
+    budget `deadline` (time.monotonic(), None = none). Returns a short log line, or None when
+    nothing was due or the file was written."""
     path = os.path.join(out, "releases.json")
     st = state.get("releases")
     st = st if isinstance(st, dict) else {}
     last = INT(st.get("t"))
     if last is not _BAD and 0 <= now - last < RELEASES_EVERY_S:
         return None
+    if _left(deadline, RELEASES_TIMEOUT_S) is None:
+        return "releases.json: no time left this run, previous file kept"
     state["releases"] = st
     st["t"] = now
     try:
-        feed_raw = fetch(RELEASES_URL, RELEASES_MAX, RELEASES_TIMEOUT_S)
-        sig_raw = fetch(RELEASES_SIG_URL, RELEASES_SIG_MAX, RELEASES_TIMEOUT_S)
-    except Exception as e:             # network, HTTP, too large: keep the previous file
+        t = _left(deadline, RELEASES_TIMEOUT_S)
+        feed_raw = fetch(RELEASES_URL, RELEASES_MAX, t)
+        t = _left(deadline, RELEASES_TIMEOUT_S)
+        if t is None:
+            raise TimeoutError("time budget")
+        sig_raw = fetch(RELEASES_SIG_URL, RELEASES_SIG_MAX, t)
+    except Exception as e:             # network, HTTP, too large, too slow: keep the previous file
         return "releases.json: fetch failed (%s), previous file kept" % type(e).__name__
     try:
-        feed, sig = verify_release_feed(feed_raw, sig_raw)
+        feed, feed_text, sig = verify_release_feed(feed_raw, sig_raw)
     except ValueError as e:
         return "releases.json: NOT published, %s; previous file kept" % e
+    # Never back: not below the newest sequence ever published here (state) nor the one in the
+    # file now, whichever is higher.
     old_feed = (_read_own(path) or {}).get("feed")
-    old_seq = INT(old_feed.get("sequence")) if isinstance(old_feed, dict) else _BAD
-    if old_seq is not _BAD and feed["sequence"] < old_seq:
+    seqs = [x for x in (INT(st.get("sequence")),
+                        INT(old_feed.get("sequence")) if isinstance(old_feed, dict) else _BAD)
+            if x is not _BAD]
+    if seqs and feed["sequence"] < max(seqs):
         return "releases.json: verified feed is older (sequence %d < %d), previous file kept" % (
-            feed["sequence"], old_seq)
+            feed["sequence"], max(seqs))
     rec = clean({"source": RELEASES_URL, "signer": RELEASES_SIGNER.lower(), "verified_unix": now,
-                 "generated_unix": now, "feed": feed,
+                 "generated_unix": now, "feed": feed, "feed_text": feed_text,
                  "feed_sha256": hashlib.sha256(feed_raw).hexdigest(), "sig": sig},
                 RELEASES_FILE, "releases")
     if rec is _BAD or len(rec) != len(RELEASES_FILE):
@@ -1731,8 +1779,8 @@ def compare_tdh(header, rows, day):
             _verdict(header.get("total_tdh"), row.get("total_boosted_tdh")))
 
 
-def fetch_tdh_rows(fetch=fetch_public):
-    d = json.loads(fetch(CROSSCHECK_URL, CROSSCHECK_MAX, HANDLE_TIMEOUT_S).decode("utf-8"))
+def fetch_tdh_rows(timeout=HANDLE_TIMEOUT_S, fetch=fetch_public):
+    d = json.loads(fetch(CROSSCHECK_URL, CROSSCHECK_MAX, timeout).decode("utf-8"))
     rows = d.get("data") if isinstance(d, dict) else None
     if not isinstance(rows, list):
         raise ValueError("unexpected answer")
@@ -1769,9 +1817,10 @@ def check_checkpoints(out):
     return "ok" if seen_ok else "unknown"
 
 
-def update_crosscheck(out, state, today, now, fetch_rows=fetch_tdh_rows):
+def update_crosscheck(out, state, today, now, fetch_rows=fetch_tdh_rows, deadline=None):
     """network.json's `crosscheck` for cycle day `today` (see above), calling 6529 only when
-    due. Never raises for a failed read."""
+    due and within the time budget `deadline` (as update_releases). Never raises for a failed
+    read; no time left means no request (and no try counted) this run."""
     st = state.get("crosscheck")
     if not isinstance(st, dict) or st.get("day") != today:
         st = {"day": today, "cutoff": "unknown", "tdh": "unknown", "tries": 0, "t": None,
@@ -1787,10 +1836,11 @@ def update_crosscheck(out, state, today, now, fetch_rows=fetch_tdh_rows):
     due = (not answered and tries < CROSSCHECK_TRIES
            and (last is _BAD or not 0 <= now - last < CROSSCHECK_RETRY_S)
            and isinstance(header, dict) and INT(header.get("cutoff_number")) is not _BAD)
-    if due:
+    timeout = _left(deadline, HANDLE_TIMEOUT_S) if due else None
+    if due and timeout is not None:
         st["tries"], st["t"] = tries + 1, now
         try:
-            rows = fetch_rows()
+            rows = fetch_rows(timeout)
         except Exception:              # network, HTTP, JSON: unknown, try again later
             rows = None
         cutoff, tdh = compare_tdh(header, rows, today)
@@ -1922,8 +1972,9 @@ def main():
     # Only meaningful for the day it was written for: a new day starts without a file.
     net["cycle_unix"] = age("cycle_unix", wrote_today_cycle) \
         if (wrote_today_cycle or previous.get("today") == today) else None
-    # The "6529 agrees" check as last computed (refreshed at the end of the run, after every
-    # file is written, so a slow 6529 never delays the network data).
+    # The "6529 agrees" check as last computed. It is refreshed at the end of the run, after
+    # every file is written, so a slow 6529 does not delay these files; it can delay the end of
+    # the run (and so the signing and upload that follow) by at most PUBLIC_BUDGET_S.
     cc = clean(previous.get("crosscheck"), CROSSCHECK, "network.crosscheck")
     net["crosscheck"] = cc if (cc is not _BAD and cc and cc.get("day") == today) else None
     write_json(os.path.join(out, "network.json"), net)
@@ -1978,15 +2029,16 @@ def main():
         except Exception as e:         # never let the handles stop the run
             print("handles not updated: %s" % type(e).__name__, file=sys.stderr)
     # 6529's signed release feed, then the "6529 agrees" check (see their sections). Each only
-    # ever leaves its own output as it was when something fails.
+    # ever leaves its own output as it was when something fails. Both share one time budget.
+    deadline = time.monotonic() + PUBLIC_BUDGET_S
     try:
-        note = update_releases(out, state, int(time.time()))
+        note = update_releases(out, state, int(time.time()), deadline=deadline)
         if note:
             print(note, file=sys.stderr)
     except Exception as e:
         print("releases.json not updated: %s" % type(e).__name__, file=sys.stderr)
     try:
-        cc = update_crosscheck(out, state, today, int(time.time()))
+        cc = update_crosscheck(out, state, today, int(time.time()), deadline=deadline)
         if cc != net.get("crosscheck"):
             net["crosscheck"] = cc
             write_json(os.path.join(out, "network.json"), net)

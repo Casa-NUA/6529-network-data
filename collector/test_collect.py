@@ -881,8 +881,9 @@ class Crypto(unittest.TestCase):
 
 class ReleaseFeed(unittest.TestCase):
     def test_real_feed_verifies(self):
-        feed, sig = collect.verify_release_feed(REAL_FEED, REAL_SIG)
+        feed, text, sig = collect.verify_release_feed(REAL_FEED, REAL_SIG)
         self.assertEqual(feed["format"], 1)
+        self.assertEqual(text.encode("utf-8"), REAL_FEED)
         self.assertEqual(sig, json.loads(REAL_SIG)["signature"].lower())
 
     def test_real_feed_altered_fails(self):
@@ -912,6 +913,8 @@ class ReleaseFeed(unittest.TestCase):
         sig = json.loads(REAL_SIG)
         for bad, why in ((b"nope", "not JSON"), (json.dumps(dict(sig, format=2)).encode(), "format"),
                          (json.dumps(dict(sig, algorithm="ecdsa-p256-sha256")).encode(), "format"),
+                         (json.dumps(dict(sig, format=True)).encode(), "format"),
+                         (json.dumps(dict(sig, format=1.0)).encode(), "format"),
                          (json.dumps(dict(sig, signature=sig["signature"] + "1b")).encode(), "64 bytes"),
                          (json.dumps(dict(sig, signature=sig["signature"][2:])).encode(), "64 bytes")):
             with self.assertRaisesRegex(ValueError, why):
@@ -961,7 +964,12 @@ class UpdateReleases(unittest.TestCase):
         self.assertIsNone(collect.update_releases(self.out, st, NOW, fetch=web))
         r = self.read()
         self.assertEqual(set(r), {"source", "signer", "verified_unix", "generated_unix", "feed",
-                                  "feed_sha256", "sig"})
+                                  "feed_text", "feed_sha256", "sig"})
+        # anyone can re-check 6529's signature from our file alone
+        self.assertEqual(r["feed_text"].encode("utf-8"), REAL_FEED)
+        self.assertEqual(collect.hashlib.sha256(r["feed_text"].encode("utf-8")).hexdigest(), r["feed_sha256"])
+        collect.verify_release_feed(r["feed_text"].encode("utf-8"), sig_file(bytes.fromhex(r["sig"][2:])))
+        self.assertEqual(json.loads(r["feed_text"]), r["feed"])
         self.assertEqual(r["source"], "https://6529.io/validator/releases.json")
         self.assertEqual(r["signer"], "0xf005f32cb7ecf25566b8cf6685394e0cc694b832")
         self.assertEqual(r["feed"], json.loads(REAL_FEED))
@@ -1008,6 +1016,97 @@ class UpdateReleases(unittest.TestCase):
         self.assertIn("older", note)
         self.assertEqual(self.read()["verified_unix"], NOW)
 
+    def test_rollback_against_state_too(self):
+        st = {}
+        collect.update_releases(self.out, st, NOW, fetch=self.web())
+        seq = json.loads(REAL_FEED)["sequence"]
+        st["releases"]["sequence"] = seq + 5   # published higher before, file since replaced
+        note = collect.update_releases(self.out, st, NOW + collect.RELEASES_EVERY_S, fetch=self.web())
+        self.assertIn("older (sequence %d < %d)" % (seq, seq + 5), note)
+        self.assertEqual(self.read()["verified_unix"], NOW)
+        os.unlink(self.path)                   # even with no file at all
+        note = collect.update_releases(self.out, st, NOW + 2 * collect.RELEASES_EVERY_S, fetch=self.web())
+        self.assertIn("older", note)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_format_true_is_not_one(self):
+        self.assertIs(collect.FEED({"format": True, "sequence": 1}), collect._BAD)
+        self.assertIs(collect.FEED({"format": 1.0, "sequence": 1}), collect._BAD)
+        self.assertIs(collect.FEED({"format": 1, "sequence": True}), collect._BAD)
+        self.assertEqual(collect.FEED({"format": 1, "sequence": 1}), {"format": 1, "sequence": 1})
+
+    def test_time_budget(self):
+        import time as _t
+        st, web = {}, self.web()
+        note = collect.update_releases(self.out, st, NOW, fetch=web, deadline=_t.monotonic() + 0.5)
+        self.assertIn("no time left", note)
+        self.assertEqual(web.calls, [])
+        self.assertNotIn("releases", st)       # not counted as an attempt
+        seen = []
+
+        def slow(url, most, timeout):
+            seen.append(timeout)
+            return web(url, most, timeout)
+        self.assertIsNone(collect.update_releases(self.out, st, NOW, fetch=slow,
+                                                  deadline=_t.monotonic() + 5))
+        self.assertTrue(all(t <= 5 for t in seen) and len(seen) == 2, seen)
+        # the budget runs out between the two requests: the second is not made
+        st2, calls = {}, []
+
+        def eat(url, most, timeout):
+            calls.append(url)
+            _t.sleep(0.3)
+            return web(url, most, timeout)
+        sub = os.path.join(self.out, "sub")
+        os.mkdir(sub)
+        note = collect.update_releases(sub, st2, NOW, fetch=eat,
+                                       deadline=_t.monotonic() + collect.PUBLIC_MIN_S + 0.2)
+        self.assertIn("fetch failed (TimeoutError)", note)
+        self.assertEqual(calls, [collect.RELEASES_URL])
+
+    def test_fetch_public_whole_call_deadline(self):
+        import time as _t
+
+        class Trickle(object):
+            status = 200
+
+            def __init__(self, n):
+                self.n = n
+
+            def read(self, k):
+                _t.sleep(0.05)
+                self.n -= 1
+                return b"x" if self.n >= 0 else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class Opener(object):
+            def __init__(self, n):
+                self.n, self.timeouts = n, []
+
+            def open(self, req, timeout):
+                self.timeouts.append(timeout)
+                return Trickle(self.n)
+        saved = collect.OPENER
+        try:
+            collect.OPENER = Opener(1000)                  # 1000 bytes, one every 50 ms
+            started = _t.monotonic()
+            with self.assertRaises(TimeoutError):
+                collect.fetch_public(collect.RELEASES_URL, 4096, 0.3)
+            self.assertLess(_t.monotonic() - started, 1.0)
+            self.assertEqual(collect.OPENER.timeouts, [0.3])
+            collect.OPENER = Opener(3)
+            self.assertEqual(collect.fetch_public(collect.RELEASES_URL, 4096, 5), b"xxx")
+            collect.OPENER = Opener(10)
+            with self.assertRaisesRegex(ValueError, "too large"):
+                collect.fetch_public(collect.RELEASES_URL, 5, 5)
+        finally:
+            collect.OPENER = saved
+
     def test_signed_and_worker_name(self):
         self.assertTrue(sign.TOP.match("releases.json"))
         self.assertTrue(any(rx.match("releases.json") for rx in sign.WORKER_NAMES))
@@ -1034,6 +1133,7 @@ class CrossCheck(unittest.TestCase):
         os.makedirs(os.path.join(self.out, "cycles"))
         self.cycle(DAY, {"day": DAY, "header": dict(HEADER_20775)})
         self.calls = 0
+        self.timeouts = []
 
     def tearDown(self):
         shutil.rmtree(self.out)
@@ -1042,8 +1142,9 @@ class CrossCheck(unittest.TestCase):
         collect.write_json(os.path.join(self.out, "cycles", "%d.json" % day), rec)
 
     def rows(self, rows=None, fail=False):
-        def f():
+        def f(timeout=None):
             self.calls += 1
+            self.timeouts.append(timeout)
             if fail:
                 raise OSError("down")
             return REAL_TDH if rows is None else rows
@@ -1097,6 +1198,17 @@ class CrossCheck(unittest.TestCase):
         r = collect.update_crosscheck(self.out, st, DAY + 1, NOW + 86400, fetch_rows=self.rows())
         self.assertEqual(self.calls, collect.CROSSCHECK_TRIES + 1)
         self.assertEqual((r["day"], r["cutoff"]), (DAY + 1, "unknown"))     # no 2026-11-19 row
+
+    def test_time_budget(self):
+        import time as _t
+        st = {}
+        r = collect.update_crosscheck(self.out, st, DAY, NOW, fetch_rows=self.rows(),
+                                      deadline=_t.monotonic() + 0.5)
+        self.assertEqual((self.calls, st["crosscheck"]["tries"], r["cutoff"]), (0, 0, "unknown"))
+        r = collect.update_crosscheck(self.out, st, DAY, NOW + 60, fetch_rows=self.rows(),
+                                      deadline=_t.monotonic() + 3)
+        self.assertEqual((self.calls, r["cutoff"]), (1, "ok"))
+        self.assertLessEqual(self.timeouts[-1], 3)
 
     def test_no_header_no_request(self):
         os.unlink(os.path.join(self.out, "cycles", "%d.json" % DAY))
