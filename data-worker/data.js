@@ -131,11 +131,20 @@ const KEY = (name) => "e:" + name;
 const dayOf = (name) => { const m = /^(days|cycles)\/(\d{5})\.json$/.exec(name); return m ? { kind: m[1], day: Number(m[2]) } : null; };
 
 // The Durable Object: one instance ("data") holding the latest accepted envelope per name, as
-// "e:<name>" -> { gen, text }, plus "names": the list of stored names (so the eviction never
-// has to read the stored files). Reached only through the DATA binding (never from outside), so
-// it trusts the Worker's signature and name checks and does the rest itself, so two POSTs cannot
-// race: the no-rollback rule for the whole batch, then one atomic write that also drops the
-// day files beyond KEEP.
+// "e:<name>" -> { gen, seq, text }, plus "names": the list of stored names (so the eviction and a
+// GET of a name never stored need no storage read). Reached only through the DATA binding (never
+// from outside), so it trusts the Worker's signature and name checks and does the rest itself,
+// so two POSTs cannot race: the no-rollback rules for the whole batch, then one atomic write
+// that also drops the day files beyond KEEP.
+//
+// No rollback, per name:
+//  - a file with generated_unix: never an older one (an equal one with other bytes is taken);
+//  - a file without one (validators, cycles/*, days/*, the indexes), which on its own could be
+//    an old signed copy replayed: only together with a CHANGED file that has generated_unix
+//    (network.json changes on every run). The batch's sequence S is the highest generated_unix
+//    among the entries it actually changes (same-bytes entries do not count); S is stored with
+//    every entry the batch writes, and a file without generated_unix is replaced only by a batch
+//    whose S is greater than the S stored with it. No such S: 409.
 export class DataStore {
   constructor(state) { this.state = state; this.cache = new Map(); this.names = undefined; }
   async fetch(req) {
@@ -148,15 +157,21 @@ export class DataStore {
       let batch;
       try { batch = JSON.parse(await req.text()); } catch { return new Response(null, { status: 400 }); }
       if (!Array.isArray(batch) || !batch.length || batch.length > MAX_ENTRIES) return new Response(null, { status: 400 });
-      const put = new Map();
+      const changed = [];
       for (const e of batch) {
         if (!e || !allowed(e.name) || typeof e.text !== "string" || !(e.gen === null || Number.isSafeInteger(e.gen))) return new Response(null, { status: 400 });
         const cur = await this.load(e.name);
         if (cur && cur.text === e.text) continue;                       // the same bytes again: nothing to do
         if (cur && cur.gen !== null && (e.gen === null || e.gen < cur.gen)) return new Response(null, { status: 409 });
-        put.set(e.name, { gen: e.gen, text: e.text });
+        changed.push([e, cur]);
       }
-      if (!put.size) return new Response(null, { status: 204 });
+      if (!changed.length) return new Response(null, { status: 204 });
+      let seq = null;
+      for (const [e] of changed) if (e.gen !== null && (seq === null || e.gen > seq)) seq = e.gen;
+      for (const [e, cur] of changed) {
+        if (e.gen === null && (seq === null || seq <= ((cur && cur.seq) || 0))) return new Response(null, { status: 409 });
+      }
+      const put = new Map(changed.map(([e]) => [e.name, { gen: e.gen, seq, text: e.text }]));
       const names = new Set([...(await this.loadNames()), ...put.keys()]);
       const evicted = [];
       for (const kind of Object.keys(KEEP)) {
@@ -164,27 +179,32 @@ export class DataStore {
         evicted.push(...days.slice(KEEP[kind]));
       }
       for (const n of evicted) { names.delete(n); put.delete(n); }
-      const list = [...names].sort();
-      const entries = { names: list };
+      const entries = { names: [...names].sort() };
       for (const [n, v] of put) entries[KEY(n)] = v;
       // No await between the two writes: the Durable Object commits them together.
       const w = [this.state.storage.put(entries)];
       if (evicted.length) w.push(this.state.storage.delete(evicted.map(KEY)));
       await Promise.all(w);
-      this.names = list;
+      this.names = names;
       for (const [n, v] of put) this.cache.set(n, v);
-      for (const n of evicted) this.cache.set(n, null);
+      for (const n of evicted) this.cache.delete(n);
       return new Response(null, { status: 204, headers: evicted.length ? { "x-evicted": evicted.join(",") } : {} });
     }
     return new Response(null, { status: 404 });
   }
+  // Only names in the stored list are read; nothing is remembered for a name not stored, so
+  // GETs of unknown names neither read storage nor grow the cache.
   async load(name) {
-    if (!allowed(name)) return null;
-    if (!this.cache.has(name)) this.cache.set(name, (await this.state.storage.get(KEY(name))) || null);
-    return this.cache.get(name);
+    if (!allowed(name) || !(await this.loadNames()).has(name)) return null;
+    let cur = this.cache.get(name);
+    if (!cur) {
+      cur = (await this.state.storage.get(KEY(name))) || null;
+      if (cur) this.cache.set(name, cur);
+    }
+    return cur;
   }
   async loadNames() {
-    if (this.names === undefined) this.names = (await this.state.storage.get("names")) || [];
+    if (this.names === undefined) this.names = new Set((await this.state.storage.get("names")) || []);
     return this.names;
   }
 }

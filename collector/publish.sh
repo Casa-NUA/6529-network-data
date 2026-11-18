@@ -1,11 +1,11 @@
 #!/bin/bash
 # Collect public network data from the local validator, send the signed files to the data
-# Worker, and push them to GitHub at most every 5 minutes.
+# Worker, and push them to GitHub at most every 4 minutes.
 # Usage: publish.sh /path/to/the-publishing-clone   (run every 2 minutes by launchd)
 #
 # Each run: collect and sign (in this folder's state/data), then POST the signed files that
 # changed to the data Worker (WORKER_URL below; data-worker/ in the repository), then, if the
-# last push was at least 5 minutes ago (state/last-push), commit and push to GitHub, which
+# last push was at least 4 minutes ago (state/last-push), commit and push to GitHub, which
 # stays the public archive and the apps' fallback. A failed POST is logged and never stops the
 # run; a git failure never stops the POST (it comes first).
 #
@@ -34,7 +34,7 @@ PY="/usr/bin/python3 -I -B"
 RUN_START=$(date +%s)
 # The data Worker (pinned here; nothing secret is sent: the signatures are the credential).
 WORKER_URL="https://monitor6529-data.casanua.workers.dev/v1/data"
-PUSH_EVERY=300                       # seconds between GitHub pushes, at least
+PUSH_EVERY=240                       # seconds between GitHub pushes, at least
 
 # The fixed copy must be real files, outside the clone and outside any git work tree.
 for f in publish.sh collect.py sign.py; do
@@ -90,7 +90,9 @@ if [ -d "$STATE/signed" ]; then
   BODY="$HERE/state/worker-body.json"
   POSTED="$HERE/state/worker-posted.json"
   rm -f "$BODY" "$POSTED.next"
-  if n="$($PY "$HERE/sign.py" --data "$STATE" --batch "$BODY" --posted "$POSTED" 2>/dev/null)"; then
+  if out="$($PY "$HERE/sign.py" --data "$STATE" --batch "$BODY" --posted "$POSTED" 2>&1)"; then
+    n="${out%% *}"
+    case "$out" in *" | "*) echo "worker: left out: ${out#* | } $(date -u +%H:%MZ)" ;; esac
     if [ -s "$BODY" ]; then
       # -q: no ~/.curlrc; https only, no proxy, no redirects followed.
       code="$(/usr/bin/curl -q -sS --proto '=https' --noproxy '*' --connect-timeout 5 --max-time 25 \
@@ -103,7 +105,7 @@ if [ -d "$STATE/signed" ]; then
       fi
     fi
   else
-    echo "worker: no batch built $(date -u +%H:%MZ)"
+    echo "worker: no batch built: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200) $(date -u +%H:%MZ)"
   fi
   rm -f "$BODY" "$POSTED.next"
 fi
@@ -144,7 +146,7 @@ fi
 
 # GitHub at most every PUSH_EVERY seconds (the Worker already has this run's files). The time
 # is the start of the run that last pushed, kept in state/last-push (next to state/data, never
-# in the clone); with 2-minute runs a push is made every third run (every 6 minutes). Without
+# in the clone); with 2-minute runs a push is made every second run (every 4 minutes). Without
 # that file (first run of this version), the last commit of network.json counts.
 LAST_PUSH="$HERE/state/last-push"
 if [ -f "$LAST_PUSH" ] && [ ! -L "$LAST_PUSH" ]; then
@@ -153,7 +155,8 @@ else
   last="$("${G[@]}" log -1 --format=%ct -- docs/data/network.json 2>/dev/null || true)"
 fi
 last="${last:-0}"
-if [ "$RUN_START" -ge "$last" ] && [ $(( RUN_START - last )) -lt "$PUSH_EVERY" ]; then
+# (5 s of slack: launchd may start a run a second early, which would otherwise skip a push.)
+if [ "$RUN_START" -ge "$last" ] && [ $(( RUN_START - last )) -lt $(( PUSH_EVERY - 5 )) ]; then
   "${G[@]}" reset --quiet --hard origin/main
   exit 0
 fi

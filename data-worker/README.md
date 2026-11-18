@@ -2,7 +2,7 @@
 
 The collector (`collector/publish.sh`, launchd agent `casa.nua.6529-network-data`, every 2 min)
 signs the data files and POSTs the signed envelopes that changed here, then pushes to GitHub at
-most every 5 minutes. The Worker keeps the latest envelope per file name in a Durable Object and
+most every 4 minutes. The Worker keeps the latest envelope per file name in a Durable Object and
 hands it, unchanged, to the apps, which read it first and fall back to
 `raw.githubusercontent.com` (GitHub's raw cache adds up to 5 minutes). Spec:
 `handoffs/specs/2026-11-18-data-worker.md`.
@@ -33,15 +33,25 @@ the envelope file's exact text; the Worker stores each value's exact bytes from 
 | 400 | not JSON / not UTF-8, not a non-empty object of objects, a name twice, envelope fields other than exactly `alg format key name payload sig`, not format 2 / ECDSA-P256-SHA256, malformed base64 or DER, payload not JSON, `generated_unix` present but not a positive integer |
 | 403 | name not on the allow-list, key id not pinned, envelope `name` not the map key, signature does not verify |
 | 422 | a payload's `generated_unix` more than 5 minutes ahead of the Worker's clock (it would block that name until then) |
-| 409 | rollback: a `generated_unix` older than the stored one for that name, or a file that has one replaced by one without (checked inside the Durable Object, so two POSTs cannot race) |
+| 409 | rollback: a `generated_unix` older than the stored one for that name, a file that has one replaced by one without, or a file without one replaced by a batch whose sequence is not newer (below); checked inside the Durable Object, so two POSTs cannot race |
 | 429 | rate limit (binding `RL`, 6 POSTs a minute per address) |
 | 503 | storage failed (nothing stored) |
 | 405 / 404 | other method / other path |
 
-No rollback rule for files without `generated_unix` (`validators.json`, `cycles/*`, `days/*`):
-a different, validly signed envelope replaces the stored one. An envelope byte for byte equal to
-the stored one is a no-op (`204`), whatever it holds, so the collector can resend everything.
-An equal `generated_unix` with other bytes is accepted.
+Files without `generated_unix` (`validators.json`, `cycles/*`, `days/*`, the index files)
+could be replayed from an old signed copy on their own, so the batch carries the clock: its
+sequence S is the highest `generated_unix` among the entries it actually changes (an entry
+byte for byte equal to the stored one does not count). S is stored with every entry the batch
+writes, and a file without `generated_unix` is written only by a batch whose S is greater than
+the S stored with that name (0 if new). A batch that changes no file with `generated_unix`
+cannot write any file without one (409). The collector's batches always carry the new
+`network.json` (it changes every run). So an old `validators.json` is refused alone, with an old
+`network.json` (rollback), and with the current one (same bytes, no S).
+
+An envelope byte for byte equal to the stored one is a no-op (`204`), so the collector can
+resend everything. An equal `generated_unix` with other bytes is accepted. The Durable Object
+reads a name from storage only if it is in its stored list, and remembers only found entries,
+so GETs of unknown names cost no read and no memory.
 
 Kept: the newest 60 `days/<day>.json` and the newest 40 `cycles/<day>.json` (by day number;
 the index files are not counted); older ones are dropped in the same write that stores a batch.
@@ -69,9 +79,11 @@ already public on GitHub.
 files whose envelope differs from what `state/worker-posted.json` says was last accepted, and
 every file once an hour (so a Worker that lost its data refills itself). Only names on the
 allow-list, only the 60/40 newest day files, top-level files first, and nothing the Worker would
-refuse for size (left for the next run). `publish.sh` POSTs it with `curl` (5 s to connect,
+refuse for size (left for the next run). A file it cannot read is skipped, and a batch that
+would change a file without `generated_unix` but no file with one is held whole for the next
+run; both are named in the log line. `publish.sh` POSTs it with `curl` (5 s to connect,
 25 s in all, https only, no proxy, no `~/.curlrc`), keeps the new record only on `204`, and on
-any failure writes one log line and goes on: GitHub still gets the files.
+any failure writes one log line (the HTTP status, or the reason no batch was built) and goes on: GitHub still gets the files.
 
 ## Files
 
@@ -80,7 +92,7 @@ any failure writes one log line and goes on: GitHub still gets the files.
 - `wrangler.toml`: Durable Object binding `DATA` → `DataStore`, migration `v1`
   (`new_sqlite_classes`), rate limits `RL` (namespace 6532) and `RL_GET` (6533); the push relay
   uses 6529, the live relay 6530 and 6531.
-- `test.mjs`, `fixtures/`: `node test.mjs` (99 checks). `fixtures/real-*.json` are files from
+- `test.mjs`, `fixtures/`: `node test.mjs` (110 checks). `fixtures/real-*.json` are files from
   `docs/data/signed/` as published (production key), unchanged. Other envelopes are signed in the
   test with throwaway WebCrypto keys: one added to the pins only there, one never pinned.
 
@@ -88,7 +100,7 @@ any failure writes one log line and goes on: GitHub still gets the files.
 
 ```sh
 cd data-worker
-node test.mjs                      # must end "99 checks passed"
+node test.mjs                      # must end "110 checks passed"
 npx wrangler whoami                # the Casa NUA account
 npx wrangler deploy --dry-run      # bundles, checks wrangler.toml, uploads nothing
 npx wrangler deploy                # first deploy: applies migration v1 (creates DataStore)

@@ -45,11 +45,15 @@ async function signed(name, payloadObj, by = TEST, { key = by.pin.id, as = name 
 // A POST body made the way the collector makes it: each envelope's exact text as the value.
 const body = (pairs) => "{" + pairs.map(([n, t]) => JSON.stringify(n) + ":" + t).join(",") + "}";
 const genOf = (t) => JSON.parse(JSON.parse(t).payload).generated_unix;
+// A fresh network.json, newer than any before: what every collector batch carries.
+let netGen = 0;
+const net = async () => { netGen = Math.max(netGen + 1, NOW); return ["network.json", await signed("network.json", { generated_unix: netGen })]; };
 
 // ---- fakes: Durable Object namespace + storage, rate limiters, clock ----------------------
 const disk = new Map();
+let reads = 0;
 const storage = {
-  async get(k) { return structuredClone(disk.get(k)); },
+  async get(k) { reads++; return structuredClone(disk.get(k)); },
   async put(k, v) { if (typeof k === "object") { for (const [a, b] of Object.entries(k)) disk.set(a, structuredClone(b)); } else disk.set(k, structuredClone(v)); },
   async delete(k) { for (const x of [].concat(k)) disk.delete(x); },
 };
@@ -169,13 +173,41 @@ await check("then the earlier one (same generated_unix) = 204", await POST(body(
 await check("a file with generated_unix replaced by one without = 409", await POST(body([["chain.json", await signed("chain.json", { x: 1 })]])), 409);
 await check("real network.json after a newer one = 409", await POST(body([["network.json", REAL["network.json"]]])), 409);
 const idx2 = await signed("days/index.json", { days: [20774, 20775] });
-await check("file without generated_unix, changed = 204", await POST(body([["days/index.json", idx2]])), 204);
+await check("file without generated_unix, changed = 204", await POST(body([await net(), ["days/index.json", idx2]])), 204);
 await check("file without generated_unix, the same bytes again = 204", await POST(body([["days/index.json", idx2]])), 204);
-await check("list payload (cycles/index.json) changed = 204", await POST(body([["cycles/index.json", await signed("cycles/index.json", [{ day: 20776 }])]])), 204);
+await check("list payload (cycles/index.json) changed = 204", await POST(body([await net(), ["cycles/index.json", await signed("cycles/index.json", [{ day: 20776 }])]])), 204);
 restartObject(); resetIsolate(); doCalls = 0;
 await check("after a restart the stored generated_unix still counts", await POST(body([["chain.json", await signed("chain.json", { generated_unix: NOW - 1 })]])), 409);
 assert.equal(doCalls, 1);
 assert.equal(await text("days/index.json"), idx2); ok.push("after a restart GET returns the stored envelope");
+
+// ---- 6b. replay of an old signed file without generated_unix --------------------------------
+const v1 = await signed("validators.json", { cycle_day: 1 }), v2 = await signed("validators.json", { cycle_day: 2 });
+await check("validators v1 with a new network.json = 204", await POST(body([await net(), ["validators.json", v1]])), 204);
+await check("validators v2 with a new network.json = 204", await POST(body([await net(), ["validators.json", v2]])), 204);
+const curNet = await text("network.json");
+await check("replay of the old validators.json alone = 409", await POST(body([["validators.json", v1]])), 409);
+await check("... with an old network.json = 409", await POST(body([["network.json", REAL["network.json"]], ["validators.json", v1]])), 409);
+await check("... with the current network.json, same bytes = 409", await POST(body([["network.json", curNet], ["validators.json", v1]])), 409);
+const chainSame = await signed("chain.json", { generated_unix: genOf(await text("chain.json")), replay: 1 });
+await check("... with a changed file whose generated_unix is not newer than the stored sequence = 409",
+  await POST(body([["chain.json", chainSame], ["validators.json", v1]])), 409);
+await check("a day file alone (never stored) = 409", await POST(body([["days/20500.json", await signed("days/20500.json", {})]])), 409);
+assert.equal(await text("validators.json"), v2); ok.push("the replayed validators.json was not stored");
+const v3 = await signed("validators.json", { cycle_day: 3 });
+await check("a normal collector batch (new network.json + changed files + same bytes) = 204",
+  await POST(body([await net(), ["chain.json", await text("chain.json")], ["validators.json", v3], ["cycles/index.json", await signed("cycles/index.json", [{ day: 1 }])]])), 204);
+assert.equal(await text("validators.json"), v3);
+await check("then v2 again with the now-current network.json (same bytes) = 409", await POST(body([["network.json", await text("network.json")], ["validators.json", v2]])), 409);
+
+// ---- 6c. GETs of names never stored: no storage read, nothing remembered ---------------------
+restartObject(); resetIsolate();
+await GET("chain.json");                                          // loads the names list
+reads = 0; const size0 = obj.cache.size;
+for (let d = 20000; d < 20100; d++) await check("GET never-stored days/" + d, await GET("days/" + d + ".json"), 404);
+assert.equal(reads, 0, "no storage read for a name not in the list");
+assert.equal(obj.cache.size, size0, "the cache did not grow");
+ok.splice(ok.length - 100, 100, "100 GETs of never-stored names: 404, no storage read, cache unchanged");
 
 // ---- 7. memo: GETs within 5 s cost one Durable Object request per name ---------------------
 resetIsolate(); doCalls = 0;
@@ -191,7 +223,7 @@ ok.push("a stored POST is served at once by the same isolate");
 const dayBatch = [];
 for (let d = 20700; d < 20762; d++) dayBatch.push(["days/" + d + ".json", await signed("days/" + d + ".json", { day: d })]);
 await GET("days/20700.json");                                     // nothing stored yet: 404, not memoized
-await check("62 day files in one batch = 204", await POST(body(dayBatch)), 204);
+await check("62 day files in one batch = 204", await POST(body([await net(), ...dayBatch])), 204);
 // days/20774.json (real) is stored too: 63 day files, keep the newest 60 -> 20700..20702 dropped
 for (const d of [20700, 20701, 20702]) await check("evicted days/" + d, await GET("days/" + d + ".json"), 404);
 for (const d of [20703, 20761]) assert.equal(await text("days/" + d + ".json"), dayBatch[d - 20700][1]);
@@ -202,11 +234,11 @@ assert.equal(stored.filter((n) => /^days\/\d{5}/.test(n)).length, 60);
 assert.equal([...disk.keys()].filter((k) => /^e:days\/\d{5}/.test(k)).length, 60);
 ok.push("days/: 60 kept (newest), index.json kept, older ones gone from storage");
 const old = await signed("days/20600.json", { day: 20600 });
-await check("an older day than the 60 kept = 204 (stored, then dropped)", await POST(body([["days/20600.json", old]])), 204);
+await check("an older day than the 60 kept = 204 (stored, then dropped)", await POST(body([await net(), ["days/20600.json", old]])), 204);
 await check("it is not served", await GET("days/20600.json"), 404);
 const cycBatch = [];
 for (let d = 20730; d < 20772; d++) cycBatch.push(["cycles/" + d + ".json", await signed("cycles/" + d + ".json", { day: d })]);
-await check("42 cycle files in one batch = 204", await POST(body(cycBatch)), 204);
+await check("42 cycle files in one batch = 204", await POST(body([await net(), ...cycBatch])), 204);
 // plus cycles/20775.json (real): 43, keep 40 -> 20730..20732 dropped
 for (const d of [20730, 20731, 20732]) await check("evicted cycles/" + d, await GET("cycles/" + d + ".json"), 404);
 assert.equal(await text("cycles/20733.json"), cycBatch[3][1]);
@@ -216,7 +248,7 @@ ok.push("cycles/: 40 kept (newest), index.json kept");
 // memo of an evicted name is dropped at once by the isolate that stored the batch
 assert.equal(await text("days/20703.json"), dayBatch[3][1]);
 const three = await Promise.all([20780, 20781, 20782].map(async (d) => ["days/" + d + ".json", await signed("days/" + d + ".json", { day: d })]));
-await check("3 more days = 204", await POST(body(three)), 204);
+await check("3 more days = 204", await POST(body([await net(), ...three])), 204);
 await check("a day evicted by it is 404 at once (memo dropped)", await GET("days/20703.json"), 404);
 restartObject(); resetIsolate();
 await check("and after a restart", await GET("days/20703.json"), 404);
@@ -227,10 +259,10 @@ ok.push("eviction survives a restart");
 const many = [];
 for (let d = 20800; d < 20901; d++) many.push(["days/" + d + ".json", await signed("days/" + d + ".json", { day: d })]);
 await check("101 entries = 413", await POST(body(many)), 413);
-await check("100 entries = 204", await POST(body(many.slice(0, 100))), 204);
+await check("100 entries = 204", await POST(body([await net(), ...many.slice(0, 99)])), 204);
 const bigEntry = await signed("validators.json", { pad: "x".repeat(2 * 1000 * 1000) });
 await check("one entry over 2 MB = 413", await POST(body([["validators.json", bigEntry]])), 413);
-await check("validators.json just under 2 MB = 204", await POST(body([["validators.json", await signed("validators.json", { pad: "x".repeat(1990000) })]])), 204);
+await check("validators.json just under 2 MB = 204", await POST(body([await net(), ["validators.json", await signed("validators.json", { pad: "x".repeat(1990000) })]])), 204);
 const huge = body([["awards.json", await signed("awards.json", { generated_unix: NOW, pad: "x".repeat(6 * 1024 * 1024) })]]);
 await check("body over 6 MB (declared length) = 413", await POST(huge), 413);
 const stream = (t) => new ReadableStream({ start(c) { const b = new TextEncoder().encode(t); for (let i = 0; i < b.length; i += 65536) c.enqueue(b.subarray(i, i + 65536)); c.close(); } });

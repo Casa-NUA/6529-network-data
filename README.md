@@ -2,7 +2,7 @@
 
 Public data about the 6529 validator network, collected every 2 minutes from
 one 6529 Validator node run by Casa NUA and published here as JSON (pushed here at most
-every 5 minutes; the same signed files are served sooner by a Cloudflare Worker, see
+every 4 minutes; the same signed files are served sooner by a Cloudflare Worker, see
 "Data Worker" below). The mobile app
 6529 Validator Monitor reads these files.
 
@@ -36,7 +36,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 |---|---|
 | `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster). |
 | `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). Each account also has `handle`: its public 6529 profile name, from 6529's public API (`api.6529.io`), or `null` when it has none or it has not been looked up yet. Each account also has `signed_days` (the days the account signed, a day counting when any of its machines signed it, since the network's first day, today included once signed) and `streak` (consecutive signed days ending today if the account signed today, else ending yesterday; a finished day without a signature resets it to 0). Both are lower bounds kept by the collector from day to day (started from the machines' `signed_30` and `first_signed_day`), so they can be too small, never too large; `null` when unknown. `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
-| `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run, published every 5 minutes. |
+| `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run (every 2 minutes, to the data Worker), pushed here every 4 minutes. |
 | `docs/data/blocks.json` | Who made (proposed) the 6529 chain's blocks, on the collecting node's current chain, for up to 7 chain days: `day` (the UTC day of the head block), `head_height`, `days` (day numbers, oldest first; a day starts at `day * 86400` UTC), `totals` (blocks per day, all makers) and `accounts`: per wallet, `counts` (its blocks per day, same order), `today_unix` (the slot time of each block it made today) and `last_unix` (the slot time of its latest block in those days). Only accounts that made a block in those days are listed; a maker that is not a validating account today is counted in `totals` but not listed. Counts are blocks proposed, not votes, and include blocks not yet final, so a count can drop after a reorganisation. `notable`: the FINAL blocks (height at most the chain's finalized height) of a notable height (6529, 10000, 42069, 65290, 69420, 100000, 420000, 1000000) among the blocks read, as `height`, `wallet` (the maker when it is a listed validating account, else `null`) and `unix` (its slot time); an empty list when there is none (a block drops out of the list with its day); the field is absent when the finalized height could not be read. Read from the node's chain store (see "Run it yourself"). |
 | `docs/data/days/<day>.json` | One past day's validator list, as last collected on that day (each machine's state at the day's end): `day`, `final` (always `true`), `w`, and `accounts` (weight first): `wallet`, `handle`, `tdh`, `weight`, `machines` (`code`, `weight`, `today`, `report` as in `validators.json`). Written once, when the day changes, and never rewritten. Days before 15 November 2026 were rebuilt from this repository's own history (the last `validators.json` committed for that day, put through the same schema); their handles are those known when they were rebuilt, so some are `null`. A day's verdict and signed share are in `cycles/<day>.json`. |
 | `docs/data/days/index.json` | `{"days": [...]}`: the days that have a file, oldest first. Today is never listed (it is `validators.json`). |
@@ -50,16 +50,16 @@ Raw URLs: `https://raw.githubusercontent.com/Casa-NUA/6529-network-data/main/doc
 
 Timing (18 Nov 2026): the collector runs every 2 minutes. Each run sends the signed files
 that changed to the data Worker (below). A commit is pushed here only when the last push
-was at least 5 minutes ago and something changed; the chain's head (`chain.json`,
-`blocks.json`, `awards.json`) moves all the time, so with 2-minute runs that is every third run
-(about every 6 minutes). This makes many small commits; old history
+was at least 4 minutes ago and something changed; the chain's head (`chain.json`,
+`blocks.json`, `awards.json`) moves all the time, so with 2-minute runs that is every second run
+(every 4 minutes). This makes many small commits; old history
 may be trimmed from time to time, as readers only need the current files.
 
 Why GitHub is not pushed more often: GitHub serves these raw files through a cache that
 keeps each file for 5 minutes (`cache-control: max-age=300`). A reader can therefore be
 handed a copy up to 5 minutes old whatever the collector does, so pushing more often would
 shave little off the delay while adding commits. A change in the network usually reaches a
-reader of these raw files within about 11 minutes (up to 6 for the next push and up to 5 for
+reader of these raw files within about 9 minutes (up to 4 for the next push and up to 5 for
 the cache), and sometimes a little more. Through the data Worker it is about 2 minutes (the
 collector's next run, plus up to 30 s of client caching). If the node or
 the collector stops, the last files stay as they are: check `generated_unix`, and
@@ -184,7 +184,7 @@ rebuild the past days from this repository's history. It also refuses a reposito
 that contains links, submodules or git control files. Keep the signing key in the
 collector folder, never in the repository. See the comments in `collector/publish.sh`
 and `collector/casa.nua.6529-network-data.plist`. Besides `state/data`, the collector keeps
-in `state/`: `last-push` (the start time of the run that last pushed, for the 5-minute rule)
+in `state/`: `last-push` (the start time of the run that last pushed, for the 4-minute rule)
 and `worker-posted.json` (a digest of each file the data Worker last accepted, so a run sends
 only what changed, and everything once an hour).
 

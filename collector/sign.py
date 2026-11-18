@@ -162,16 +162,20 @@ def _worker_order(name):
 
 
 def worker_batch(signed_root, posted, now):
-    """(body text or None, the next `posted` record, number of files in the body) for one POST
-    to the data Worker.
+    """(body text or None, the next `posted` record, number of files in the body, notes) for
+    one POST to the data Worker. `notes` lists what was left out and why (for the log line).
 
     `posted` is {"files": {name: sha256 of the envelope last accepted}, "full_unix": time of
     the last POST that held every file}. A file goes in when its envelope differs from that
     record, and every file goes in once an hour (so a Worker that lost its data is refilled;
     the Worker takes the same bytes again as a no-op). Only names the Worker accepts, and only
     the newest days/cycles it keeps. The Worker stores a batch all or nothing, so what would
-    make it refuse one (too big, too many) is left for the next run instead: top-level files
-    first, then the index files, then the day files newest first."""
+    make it refuse one (too big, too many, unreadable) is left for the next run instead:
+    top-level files first, then the index files, then the day files newest first.
+
+    The Worker replaces a file without generated_unix (validators.json, cycles/*, days/*) only
+    in a batch that also changes a file with one (network.json changes every run): a batch
+    that would change such a file without one is held whole for the next run."""
     files = posted.get("files") if isinstance(posted, dict) else None
     files = files if isinstance(files, dict) else {}
     full_unix = posted.get("full_unix") if isinstance(posted, dict) else None
@@ -185,9 +189,14 @@ def worker_batch(signed_root, posted, now):
         keep.update(days[:limit])
     names = [n for n in names if "/" not in n or n.endswith("/index.json") or n in keep]
     names.sort(key=_worker_order)
-    parts, size, nxt = [], 2, {}
+    parts, size, nxt, notes = [], 2, {}, []
+    changed_gen = changed_plain = False
     for name in names:
-        raw = read_regular(os.path.join(signed_root, name))
+        try:
+            raw = read_regular(os.path.join(signed_root, name))
+        except (Refuse, OSError) as e:
+            notes.append("%s: unreadable (%s)" % (name, type(e).__name__))
+            continue
         digest = hashlib.sha256(raw).hexdigest()
         if not full and files.get(name) == digest:
             nxt[name] = digest
@@ -195,27 +204,40 @@ def worker_batch(signed_root, posted, now):
         try:
             text = raw.decode("utf-8")
             env = json.loads(text)
-            if not isinstance(env, dict) or env.get("name") != name:
+            if not isinstance(env, dict) or env.get("name") != name or not isinstance(env.get("payload"), str):
                 raise ValueError
+            payload = json.loads(env["payload"])
         except ValueError:
+            notes.append("%s: not an envelope of that name" % name)
             continue
+        has_gen = isinstance(payload, dict) and "generated_unix" in payload
         item = json.dumps(name) + ":" + text
         if len(raw) > WORKER_MAX_ENTRY or len(parts) >= WORKER_MAX_ENTRIES \
                 or size + len(item.encode("utf-8")) + 1 > WORKER_MAX_BODY:
+            notes.append("%s: over the Worker's limits, next run" % name)
             if name in files:
                 nxt[name] = files[name]
             continue
         parts.append(item)
         size += len(item.encode("utf-8")) + 1
         nxt[name] = digest
+        if files.get(name) != digest:
+            if has_gen:
+                changed_gen = True
+            else:
+                changed_plain = True
+    if changed_plain and not changed_gen:
+        notes.append("held: no changed file with generated_unix in the batch")
+        return None, posted, 0, notes
     if not parts:
-        return None, posted, 0
-    # A file left out (too big, unreadable) is not in the record, or keeps its old digest, so
-    # the next run tries it again.
-    return "{" + ",".join(parts) + "}", {"files": nxt, "full_unix": now if full else full_unix}, len(parts)
+        return None, posted, 0, notes
+    # A file left out is not in the record, or keeps its old digest, so the next run tries it.
+    return ("{" + ",".join(parts) + "}", {"files": nxt, "full_unix": now if full else full_unix},
+            len(parts), notes)
 
 
 def batch_main(a):
+    """Prints one line: the number of files in the body, then what was left out, if anything."""
     root = os.path.abspath(a.data)
     real_dir(root, "data directory")
     signed = os.path.join(root, "signed")
@@ -225,13 +247,14 @@ def batch_main(a):
             posted = json.load(f)
     except (OSError, ValueError):
         posted = {}
-    body, nxt, count = worker_batch(signed, posted, int(time.time()))
-    if body is None:
-        print("0")
-        return 0
-    write_text(a.batch, body)
-    write_text(a.posted + ".next", json.dumps(nxt, sort_keys=True))
-    print(count)
+    body, nxt, count, notes = worker_batch(signed, posted, int(time.time()))
+    if body is not None:
+        write_text(a.batch, body)
+        write_text(a.posted + ".next", json.dumps(nxt, sort_keys=True))
+    line = str(count)
+    if notes:
+        line += " | " + "; ".join(notes)
+    print(line[:400].replace("\n", " "))
     return 0
 
 

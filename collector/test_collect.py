@@ -449,15 +449,17 @@ class WorkerBatch(unittest.TestCase):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w") as f:
             f.write(json.dumps({"alg": "ECDSA-P256-SHA256", "format": 2, "key": "k", "name": name,
-                                "payload": "{}" + extra, "sig": "s"}, separators=(",", ":")))
+                                "payload": ('{"generated_unix":1}' if name in ("network.json", "chain.json")
+                                            else "{}") + extra,
+                                "sig": "s"}, separators=(",", ":")))
 
     def text(self, name):
         with open(os.path.join(self.root, name)) as f:
             return f.read()
 
     def test_body_order_and_exact_text(self):
-        body, nxt, n = sign.worker_batch(self.root, {}, NOW)
-        self.assertEqual(n, 7)
+        body, nxt, n, notes = sign.worker_batch(self.root, {}, NOW)
+        self.assertEqual((n, notes), (7, []))
         names = ["chain.json", "network.json", "cycles/index.json", "days/index.json",
                  "cycles/20775.json", "days/20774.json", "days/20773.json"]
         self.assertEqual(body, "{" + ",".join(json.dumps(x) + ":" + self.text(x) for x in names) + "}")
@@ -466,16 +468,16 @@ class WorkerBatch(unittest.TestCase):
         self.assertEqual(sorted(nxt["files"]), sorted(names))
 
     def test_only_changed_then_hourly_full(self):
-        _, nxt, _ = sign.worker_batch(self.root, {}, NOW)
-        self.assertEqual(sign.worker_batch(self.root, nxt, NOW + 60), (None, nxt, 0))
+        _, nxt, _, _ = sign.worker_batch(self.root, {}, NOW)
+        self.assertEqual(sign.worker_batch(self.root, nxt, NOW + 60), (None, nxt, 0, []))
         self.put("network.json", " ")
-        body, nxt2, n = sign.worker_batch(self.root, nxt, NOW + 120)
+        body, nxt2, n, _ = sign.worker_batch(self.root, nxt, NOW + 120)
         self.assertEqual((n, list(json.loads(body))), (1, ["network.json"]))
         self.assertEqual(nxt2["full_unix"], NOW)                    # not a full send
-        body, nxt3, n = sign.worker_batch(self.root, nxt2, NOW + 3600)
+        body, nxt3, n, _ = sign.worker_batch(self.root, nxt2, NOW + 3600)
         self.assertEqual((n, nxt3["full_unix"]), (7, NOW + 3600))   # every file once an hour
         os.unlink(os.path.join(self.root, "days/20773.json"))
-        _, nxt4, _ = sign.worker_batch(self.root, {}, NOW)
+        _, nxt4, _, _ = sign.worker_batch(self.root, {}, NOW)
         self.assertNotIn("days/20773.json", nxt4["files"])
         for bad in (None, [], {"files": [], "full_unix": "x"}):     # a bad record: send everything
             self.assertEqual(sign.worker_batch(self.root, bad, NOW)[2], 6)
@@ -483,7 +485,7 @@ class WorkerBatch(unittest.TestCase):
     def test_limits_left_for_next_run(self):
         for d in range(20700, 20770):
             self.put("days/%d.json" % d)
-        body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+        body, nxt, n, _ = sign.worker_batch(self.root, {}, NOW)
         days = [x for x in json.loads(body) if x.startswith("days/2")]
         self.assertEqual(len(days), 60)                              # only the 60 the Worker keeps
         self.assertEqual(days[0], "days/20774.json")
@@ -491,23 +493,53 @@ class WorkerBatch(unittest.TestCase):
         old = sign.WORKER_MAX_ENTRIES
         sign.WORKER_MAX_ENTRIES = 3
         try:
-            body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+            body, nxt, n, notes = sign.worker_batch(self.root, {}, NOW)
             self.assertEqual(list(json.loads(body)), ["chain.json", "network.json", "cycles/index.json"])
-            body2, _, _ = sign.worker_batch(self.root, nxt, NOW + 60)   # the rest go next run
-            self.assertEqual(list(json.loads(body2)), ["days/index.json", "cycles/20775.json", "days/20774.json"])
+            self.assertIn("days/index.json: over the Worker's limits, next run", notes)
+            # the rest has no file with generated_unix: held until network.json changes
+            body2, nxt2, n2, notes2 = sign.worker_batch(self.root, nxt, NOW + 60)
+            self.assertEqual((body2, nxt2, n2), (None, nxt, 0))
+            self.assertIn("held: no changed file with generated_unix in the batch", notes2)
+            self.put("network.json", " ")
+            body3, _, _, _ = sign.worker_batch(self.root, nxt, NOW + 120)
+            self.assertEqual(list(json.loads(body3)), ["network.json", "days/index.json", "cycles/20775.json"])
         finally:
             sign.WORKER_MAX_ENTRIES = old
         self.put("network.json", " " * (sign.WORKER_MAX_ENTRY + 1))  # too big for the Worker
-        body, nxt, n = sign.worker_batch(self.root, {}, NOW)
+        body, nxt, n, _ = sign.worker_batch(self.root, {}, NOW)
         self.assertNotIn("network.json", json.loads(body))
         self.assertNotIn("network.json", nxt["files"])
 
     def test_misnamed_envelope_left_out(self):
         with open(os.path.join(self.root, "chain.json"), "w") as f:
             f.write(json.dumps({"name": "network.json"}))
-        body, nxt, _ = sign.worker_batch(self.root, {}, NOW)
+        body, nxt, _, notes = sign.worker_batch(self.root, {}, NOW)
         self.assertNotIn("chain.json", json.loads(body))
         self.assertNotIn("chain.json", nxt["files"])
+        self.assertEqual(notes, ["chain.json: not an envelope of that name"])
+
+    def test_unreadable_file_skipped_not_fatal(self):
+        p = os.path.join(self.root, "days/20773.json")
+        os.unlink(p)
+        os.symlink(os.path.join(self.root, "days/20774.json"), p)    # read_regular refuses a link
+        body, nxt, n, notes = sign.worker_batch(self.root, {}, NOW)
+        self.assertEqual(n, 6)
+        self.assertNotIn("days/20773.json", json.loads(body))
+        self.assertEqual(notes, ["days/20773.json: unreadable (OSError)"])
+
+    def test_cli_one_line(self):
+        out = os.path.join(self.root, "..", os.path.basename(self.root) + "-out")
+        os.makedirs(os.path.join(out, "signed"))
+        self.addCleanup(shutil.rmtree, out)
+        os.rmdir(os.path.join(out, "signed"))
+        shutil.copytree(self.root, os.path.join(out, "signed"))
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        cmd = [sys.executable, "-I", "-B", os.path.join(here, "sign.py"), "--data", out,
+               "--batch", os.path.join(out, "body.json"), "--posted", os.path.join(out, "posted.json")]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "7\n", ""))
+        self.assertTrue(os.path.exists(os.path.join(out, "posted.json.next")))
 
 
 class DistributedTotal(unittest.TestCase):

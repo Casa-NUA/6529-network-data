@@ -24,7 +24,7 @@
   <!-- Every 2 minutes (18 Nov 2026). Each run sends the changed signed files to the data
        Worker (monitor6529-data), which the apps read first; publish.sh pushes to GitHub
        (archive and fallback, behind a 5-minute raw cache) only when the last push is at
-       least 5 minutes old, so every third run. -->
+       least 4 minutes old, so every second run. -->
   <key>StartInterval</key><integer>120</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/CLONE.log</string>
