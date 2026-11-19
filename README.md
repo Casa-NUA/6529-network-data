@@ -34,7 +34,7 @@ NUA's own validator. This was found by the transparency audit of 14 November 202
 
 | File | What it is |
 |---|---|
-| `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster), and `crosscheck` (from 18 Nov 2026; see "6529 agrees" below): `day`, `cutoff`, `tdh` and `checkpoint`, each `ok`, `differs` or `unknown`, and `checked_unix` (when 6529's numbers were last read, `null` if not yet that day); `null` until the first check of the day. |
+| `docs/data/network.json` | `generated_unix` (collection time), `validators_unix` and `cycle_unix` (when `validators.json` and today's cycle file were last written: normally the same moment, older if the node could not supply them on the last run; `null` when unknown, and `cycle_unix` is `null` on a new day until that day's file exists), `rule_version`, `chain_id`, `network_id`, `today` (the cycle day), `first_day`, `latest_certified_day`, `latest_final_day`, `next_keys` and `next_accounts` (sizes of tomorrow's roster), and `crosscheck` (from 18 Nov 2026; see "6529 agrees" below): `day`, `cutoff`, `tdh` and `checkpoint`, each `ok`, `differs` or `unknown`, and `checked_unix` (when 6529's numbers were last read, `null` if not yet that day); `null` until the first check of the day. And `app` (from 19 Nov 2026; see "App version" below): `{"ios": {"version", "released_unix"}}`, the Monitor iOS app's current App Store version and its release time; `null` until first known. |
 | `docs/data/validators.json` | `cycle_day`, `w` (total weight), `accounts`: every validating account (`wallet`, `tdh`, `weight`) and its `machines` (`code`: 8-character key code, `weight`, `today`: today's state, `signed_unix`: when it signed today's result, in unix seconds, or null (validator rc.17 and later), `first_signed_day`, `last_signed_day`, `signed_7`, `signed_30`, and `report`: what the operator chose to declare: `infrastructure` (home or rack), `continent`, `country`, `software` version, `source_class`). Each account also has `handle`: its public 6529 profile name, from 6529's public API (`api.6529.io`), or `null` when it has none or it has not been looked up yet. Each account also has `signed_days` (the days the account signed, a day counting when any of its machines signed it, since the network's first day, today included once signed) and `streak` (consecutive signed days ending today if the account signed today, else ending yesterday; a finished day without a signature resets it to 0). Both are lower bounds kept by the collector from day to day (started from the machines' `signed_30` and `first_signed_day`), so they can be too small, never too large; `null` when unknown. `next_day` and `next_members` (per wallet: number of keys and TDH announced for tomorrow). `continents` and `places`: totals. |
 | `docs/data/chain.json` | The 6529 chain (from validator 0.1.0-rc.16, test currency $fake6529), as the collecting node sees it: `state`, `reason`, `head`, `finalized`, timing, `currency`, `rules` and `fees`. Updated every run (every 2 minutes, to the data Worker), pushed here every 4 minutes. |
 | `docs/data/blocks.json` | Who made (proposed) the 6529 chain's blocks, on the collecting node's current chain, for up to 7 chain days: `day` (the UTC day of the head block), `head_height`, `days` (day numbers, oldest first; a day starts at `day * 86400` UTC), `totals` (blocks per day, all makers) and `accounts`: per wallet, `counts` (its blocks per day, same order), `today_unix` (the slot time of each block it made today) and `last_unix` (the slot time of its latest block in those days). Only accounts that made a block in those days are listed; a maker that is not a validating account today is counted in `totals` but not listed. Counts are blocks proposed, not votes, and include blocks not yet final, so a count can drop after a reorganisation. `notable`: the FINAL blocks (height at most the chain's finalized height) of a notable height (6529, 10000, 42069, 65290, 69420, 100000, 420000, 1000000) among the blocks read, as `height`, `wallet` (the maker when it is a listed validating account, else `null`) and `unix` (its slot time); an empty list when there is none (a block drops out of the list with its day); the field is absent when the finalized height could not be read. Read from the node's chain store (see "Run it yourself"). |
@@ -160,7 +160,8 @@ rc.18 `awards/network/days`, `awards/network/day/<day>` and
 `awards/network/day/<day>/blocks`). The requests that leave the machine are the handle
 lookups at `api.6529.io`, 6529's release feed (`6529.io/validator/releases.json` and `.sig`, at
 most every 15 minutes) and the "6529 agrees" check (`api.6529.io/api/tdh_global_history`, at
-most 3 times a day), all public GETs. For
+most 3 times a day) and Apple's public App Store lookup for our own iOS app
+(`itunes.apple.com/lookup?id=6834147132&country=us`, at most once an hour), all public GETs. For
 `blocks.json` it also reads one file of the node's chain store on disk, the index of
 blocks (`chain/<id>/index/blocks.log`: public chain facts), and the node's own block
 count from the API (`chain/me`, `awards`, `awards/days`), which it uses only to check
@@ -233,6 +234,22 @@ Each is `ok` (the same), `differs` (6529's number is known and is not ours) or `
 could not be read, has nothing for that day yet, or our side is missing). A failed read is
 always `unknown`, never `differs`. `api.6529.io` is 6529's word over TLS, without a signature; the
 checkpoint is 6529-signed.
+
+## App version (19 Nov 2026)
+
+`network.json`'s `app` is `{"ios": {"version": "1.2.3", "released_unix": 1794729600}}`: the
+version of the 6529 Validator Monitor iOS app now on the App Store (`results[0].version`) and
+when it was released (`currentVersionReleaseDate`, as Unix seconds), so the app can tell its
+users that an update exists. The collector asks Apple's public lookup for our own app,
+`https://itunes.apple.com/lookup?id=6834147132&country=us` (no user data), at most once an hour
+(kept in its state; a failed attempt also waits the hour), within the same 20-second budget as
+the two checks above. The answer is checked strictly: the result must be app `6834147132`, the
+version must match `^\d{1,3}(\.\d{1,3}){1,2}$` (no trailing newline), and the date must parse
+(`YYYY-MM-DDTHH:MM:SSZ`) and fall between 1 Jan 2024 and a day after now. On any failure
+(network, HTTP, JSON, another app, an odd version or date) the previous value is kept, from the
+state or else from the `network.json` already published; nothing unchecked is ever published.
+Android is not included: Google Play has no public lookup, and the Android app uses Play's own
+in-app update check.
 
 ## Data Worker (18 Nov 2026)
 

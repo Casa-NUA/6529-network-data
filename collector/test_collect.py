@@ -1249,5 +1249,101 @@ class CrossCheck(unittest.TestCase):
         self.assertEqual(collect.check_checkpoints(self.out), "ok")
 
 
+def apple(version="1.2.3", date="2026-11-15T08:00:00Z", track=collect.APP_STORE_ID, **extra):
+    r = {"trackId": track, "version": version, "currentVersionReleaseDate": date,
+         "bundleId": "x", "releaseNotes": "ignored"}
+    r.update(extra)
+    return json.dumps({"resultCount": 1, "results": [r]}).encode()
+
+
+class AppVersion(unittest.TestCase):
+    URL = collect.APP_LOOKUP_URL
+
+    def run_app(self, st, answer, now=NOW, previous=None, **kw):
+        web = FakeWeb({self.URL: answer})
+        app, note = collect.update_app(st, now, previous, fetch=web, **kw)
+        return app, note, web
+
+    def test_ok(self):
+        self.assertEqual(self.URL, "https://itunes.apple.com/lookup?id=6834147132&country=us")
+        st = {}
+        app, note, web = self.run_app(st, apple())
+        self.assertEqual(app, {"ios": {"version": "1.2.3", "released_unix": 1794729600}})
+        self.assertIsNone(note)
+        self.assertEqual(web.calls, [self.URL])
+        self.assertEqual(st["app"]["ios"], app["ios"])
+        self.assertEqual(collect.app_known(st), app)
+        app, _, _ = self.run_app({}, apple(version="2.0"))
+        self.assertEqual(app["ios"]["version"], "2.0")
+
+    def test_malformed_never_published(self):
+        bad = [b"", b"not json", b"[]", b'{"resultCount":0,"results":[]}',
+               apple(track=123), apple(version="1"), apple(version="1.2.3.4"),
+               apple(version="1.2.3-beta"), apple(version="1234.0"), apple(version=" 1.2"),
+               apple(version="1.2\n"), apple(version=12), apple(date="yesterday"),
+               apple(date="2026-11-15T08:00:00Z\\n"),
+               apple(date="2026-13-40T08:00:00Z"), apple(date="2019-01-01T00:00:00Z"),
+               apple(date="2027-01-01T00:00:00Z"), apple(date=None), b"\xff\xfe"]
+        for raw in bad:
+            st = {}
+            app, note, _ = self.run_app(st, raw)
+            self.assertIsNone(app, raw)
+            self.assertIn("NOT published", note, raw)
+            self.assertNotIn("ios", st["app"])
+
+    def test_failure_keeps_previous(self):
+        st = {}
+        good, _, _ = self.run_app(st, apple())
+        later = NOW + collect.APP_EVERY_S
+        for i, answer in enumerate((None, OSError("down"), TimeoutError("slow"),
+                                    apple(version="x.y"), b"{}")):
+            app, note, web = self.run_app(st, answer, now=later * (i + 2))
+            self.assertEqual(web.calls, [self.URL])
+            self.assertEqual(app, good)
+            self.assertIn("previous value kept", note)
+        # no state (lost): the value already in network.json is kept, if it is valid
+        app, _, _ = self.run_app({}, OSError("down"), previous=good)
+        self.assertEqual(app, good)
+        for prev in ({"ios": {"version": "1.2"}}, {"ios": {"version": "1;2", "released_unix": 1}},
+                     {"android": {}}, "1.2.3", None):
+            app, _, _ = self.run_app({}, OSError("down"), previous=prev)
+            self.assertIsNone(app, prev)
+        # a broken state is ignored, not fatal
+        app, _, _ = self.run_app({"app": "garbage"}, apple())
+        self.assertEqual(app, good)
+
+    def test_once_an_hour(self):
+        st = {}
+        self.run_app(st, apple())
+        app, note, web = self.run_app(st, apple(version="9.9"), now=NOW + collect.APP_EVERY_S - 1)
+        self.assertEqual((web.calls, app["ios"]["version"], note), ([], "1.2.3", None))
+        app, _, web = self.run_app(st, apple(version="9.9"), now=NOW + collect.APP_EVERY_S)
+        self.assertEqual((web.calls, app["ios"]["version"]), ([self.URL], "9.9"))
+        # a failed attempt also counts: not retried before the hour is up
+        st = {}
+        self.run_app(st, OSError("down"))
+        _, _, web = self.run_app(st, apple(), now=NOW + 60)
+        self.assertEqual(web.calls, [])
+        # the clock going back does not block it
+        _, _, web = self.run_app(st, apple(), now=NOW - 60)
+        self.assertEqual(web.calls, [self.URL])
+
+    def test_time_budget(self):
+        import time as _t
+        st = {}
+        app, note, web = self.run_app(st, apple(), deadline=_t.monotonic() + 0.5)
+        self.assertEqual((app, web.calls), (None, []))
+        self.assertIn("no time left", note)
+        self.assertNotIn("t", st["app"])     # not counted as an attempt
+        seen = []
+        def f(url, most, timeout):
+            seen.append(timeout)
+            return apple()
+        collect.update_app({}, NOW, fetch=f, deadline=_t.monotonic() + 5)
+        self.assertTrue(0 < seen[0] <= 5)
+        collect.update_app({}, NOW, fetch=f)
+        self.assertEqual(seen[1], collect.APP_TIMEOUT_S)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

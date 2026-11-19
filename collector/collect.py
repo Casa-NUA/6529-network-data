@@ -40,6 +40,7 @@ Python 3.9+, standard library only.
                        [--state /path/outside/data/collector-state.json]
 """
 import argparse
+import calendar
 import glob
 import hashlib
 import http.client
@@ -1852,6 +1853,92 @@ def update_crosscheck(out, state, today, now, fetch_rows=fetch_tdh_rows, deadlin
     return None if res is _BAD else res
 
 
+# ---- The Monitor app's current iOS version --------------------------------------------
+# network.json `app` = {"ios": {"version", "released_unix"}}: the version of our own iOS app
+# on the App Store, from Apple's public lookup (APP_LOOKUP_URL, no user data), so the app can
+# tell its users an update exists. At most once an hour (state "app"), inside the same
+# PUBLIC_BUDGET_S as the release feed and the cross-check. Strictly checked; on any failure
+# (network, HTTP, JSON, another app, odd version or date) the previous value stays. Android
+# is not included: Google Play has no public lookup, the Android app uses Play's own check.
+APP_STORE_ID = 6834147132
+APP_LOOKUP_URL = "https://itunes.apple.com/lookup?id=%d&country=us" % APP_STORE_ID
+APP_EVERY_S = 3600
+APP_TIMEOUT_S = 8
+APP_MAX = 256 * 1024
+APP_EARLIEST_UNIX = 1704067200         # 2024-01-01: a release date before this is not ours
+APP_VERSION = RE(r"^\d{1,3}(\.\d{1,3}){1,2}\Z")   # \Z: no trailing newline
+APP = {"ios": {"version": APP_VERSION, "released_unix": INT}}
+
+
+def _app_ok(v):
+    """`v` when it is a complete, valid `app` value, else None."""
+    r = clean(v, APP, "app") if isinstance(v, dict) else _BAD
+    if r is _BAD or not r or not isinstance(r.get("ios"), dict) or len(r["ios"]) != 2:
+        return None
+    return r
+
+
+def parse_app_lookup(raw, now):
+    """{"version", "released_unix"} from Apple's lookup answer; raises ValueError otherwise."""
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise ValueError("not JSON")
+    res = doc.get("results") if isinstance(doc, dict) else None
+    if not isinstance(res, list) or not res or not isinstance(res[0], dict):
+        raise ValueError("no result")
+    r = res[0]
+    if r.get("trackId") != APP_STORE_ID:
+        raise ValueError("another app")
+    version = r.get("version")
+    if APP_VERSION(version) is _BAD:
+        raise ValueError("odd version")
+    date = r.get("currentVersionReleaseDate")
+    if not isinstance(date, str) or not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z", date):
+        raise ValueError("odd date")
+    try:
+        t = int(calendar.timegm(time.strptime(date, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, OverflowError):
+        raise ValueError("odd date")
+    if not APP_EARLIEST_UNIX <= t <= now + 86400:
+        raise ValueError("date out of range")
+    return {"version": version, "released_unix": t}
+
+
+def app_known(state, previous=None):
+    """The last good `app` value: the collector's state, else `previous` (network.json's)."""
+    st = state.get("app")
+    return (_app_ok({"ios": st.get("ios")}) if isinstance(st, dict) else None) or _app_ok(previous)
+
+
+def update_app(state, now, previous=None, fetch=fetch_public, deadline=None):
+    """network.json's `app` (see above): Apple asked when due and within the time budget
+    `deadline` (as update_releases); otherwise, and on any failure, the last good value
+    (state, else `previous`, the value in the network.json now). Returns (app or None, note)."""
+    st = state.get("app")
+    st = st if isinstance(st, dict) else {}
+    good = app_known(state, previous)
+    last = INT(st.get("t"))
+    note = None
+    if last is _BAD or not 0 <= now - last < APP_EVERY_S:
+        t = _left(deadline, APP_TIMEOUT_S)
+        if t is None:
+            note = "app version: no time left this run, previous value kept"
+        else:
+            st["t"] = now
+            try:
+                ios = parse_app_lookup(fetch(APP_LOOKUP_URL, APP_MAX, t), now)
+                good = _app_ok({"ios": ios}) or good
+            except ValueError as e:
+                note = "app version: NOT published, %s; previous value kept" % e
+            except Exception as e:     # network, HTTP, too large, too slow
+                note = "app version: fetch failed (%s), previous value kept" % type(e).__name__
+    if good:
+        st["ios"] = good["ios"]
+    state["app"] = st
+    return good, note
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="site data directory")
@@ -1977,6 +2064,8 @@ def main():
     # the run (and so the signing and upload that follow) by at most PUBLIC_BUDGET_S.
     cc = clean(previous.get("crosscheck"), CROSSCHECK, "network.crosscheck")
     net["crosscheck"] = cc if (cc is not _BAD and cc and cc.get("day") == today) else None
+    # The iOS app's App Store version as last known (refreshed at the end of the run too).
+    net["app"] = app_known(state, previous.get("app"))
     write_json(os.path.join(out, "network.json"), net)
 
     # The 6529 chain (rc.16+). Optional: older nodes have no /chain.
@@ -2029,7 +2118,8 @@ def main():
         except Exception as e:         # never let the handles stop the run
             print("handles not updated: %s" % type(e).__name__, file=sys.stderr)
     # 6529's signed release feed, then the "6529 agrees" check (see their sections). Each only
-    # ever leaves its own output as it was when something fails. Both share one time budget.
+    # ever leaves its own output as it was when something fails. Then the iOS app's version. All
+    # three share one time budget.
     deadline = time.monotonic() + PUBLIC_BUDGET_S
     try:
         note = update_releases(out, state, int(time.time()), deadline=deadline)
@@ -2044,6 +2134,15 @@ def main():
             write_json(os.path.join(out, "network.json"), net)
     except Exception as e:
         print("crosscheck not updated: %s" % type(e).__name__, file=sys.stderr)
+    try:
+        app, note = update_app(state, int(time.time()), previous.get("app"), deadline=deadline)
+        if note:
+            print(note, file=sys.stderr)
+        if app != net.get("app"):
+            net["app"] = app
+            write_json(os.path.join(out, "network.json"), net)
+    except Exception as e:
+        print("app version not updated: %s" % type(e).__name__, file=sys.stderr)
     save_state(state_path, state)
 
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):
