@@ -2,7 +2,7 @@
 """Sign the published data files, so readers can check who published them.
 
 For every data file `<data>/<name>` (network.json, chain.json, validators.json, blocks.json,
-history.json, awards.json, releases.json, cycles/index.json, cycles/<day>.json, days/index.json,
+history.json, awards.json, releases.json, health.json, cycles/index.json, cycles/<day>.json, days/index.json,
 days/<day>.json) this writes `<data>/signed/<name>`:
 
     {"format": 2, "alg": "ECDSA-P256-SHA256", "key": "<key id>", "name": "<name>",
@@ -51,7 +51,7 @@ import time
 
 OPENSSL = "/usr/bin/openssl" if os.path.exists("/usr/bin/openssl") else "openssl"
 ALG = "ECDSA-P256-SHA256"
-TOP = re.compile(r"^(network|chain|validators|blocks|history|awards|releases)\.json$")
+TOP = re.compile(r"^(network|chain|validators|blocks|history|awards|releases|health)\.json$")
 CYCLE = re.compile(r"^(index|[0-9]{1,6})\.json$")
 SUBDIRS = ("cycles", "days")          # each holds index.json and <day>.json only
 MAX_BYTES = 8 * 1024 * 1024
@@ -144,7 +144,7 @@ def write_text(path, text):
 
 
 # The names the data Worker accepts (data-worker/data.js), and how many day files it keeps.
-WORKER_NAMES = (re.compile(r"^(network|validators|blocks|chain|awards|history|releases)\.json$"),
+WORKER_NAMES = (re.compile(r"^(network|validators|blocks|chain|awards|history|releases|health)\.json$"),
                 re.compile(r"^cycles/(index|[0-9]{5})\.json$"),
                 re.compile(r"^days/(index|[0-9]{5})\.json$"))
 WORKER_KEEP = {"days": 60, "cycles": 40}

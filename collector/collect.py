@@ -25,7 +25,8 @@ day's validator list), history.json (network size and software per day) and
 awards.json (the chain's per-account awards over the last days, from the node's
 awards/network routes, and which keys proposed or voted in the last 10 minutes; from
 rc.19 also each validating account's balance, vesting and earned total, read in
-rotation from chain/account/<wallet>), and
+rotation from chain/account/<wallet>), health.json (from 20 Nov 2026: each machine's
+votes per 5 minutes over the last 24 h, from the same blocks route), and
 adds each account's public 6529 handle (from api.6529.io) to validators.json. From
 18 Nov 2026 it also republishes 6529's signed release feed as releases.json once its
 signature verifies, and adds network.json `crosscheck` ("6529 agrees", against
@@ -846,6 +847,12 @@ def roll_day(out, state, vals):
             rec = day_record(last, state)
             if rec and write_day(out, rec):
                 wrote = rec["day"]
+            # Days skipped entirely (no run saw them): the node gives no past day's list
+            # (see build_history), so they are recorded as missing, never made up.
+            skipped = range(last["cycle_day"] + 1, vals["cycle_day"])
+            if 0 < len(skipped) <= 4000:
+                kept = state.get("missing_days") if isinstance(state.get("missing_days"), list) else []
+                state["missing_days"] = sorted(set(d for d in kept if _req_int(d)) | set(skipped))[-4000:]
         elif vals["cycle_day"] < last["cycle_day"]:
             return None                # the node went back a day (resync): keep what we had
     if isinstance(vals.get("cycle_day"), int):
@@ -1040,7 +1047,27 @@ def build_history(out, state, today_rec, now):
     cleaned = clean(rows, LIST(HISTORY_ROW, 4000), "history.days")
     if cleaned is _BAD or not cleaned:
         return None
-    return {"generated_unix": now, "days": cleaned}
+    return {"generated_unix": now, "days": cleaned,
+            "missing_days": missing_days(out, state, today)}
+
+
+# history.json `missing_days`: past days with no days/<day>.json, so the apps can show
+# "no data" instead of silently joining the days on each side. The node has no route for
+# a past day's validator list (network gives today's only; cycles/<day> is the day's
+# certificate: totals, not machines), so such a day cannot be rebuilt. A day is missing
+# when the collector saw the day jump over it (roll_day, kept in the state file), or when
+# it lies between the archive's first day and today without a file. A missing day that
+# later gets a file (a manual backfill) is no longer listed.
+def missing_days(out, state, today):
+    have = day_files(out)
+    kept = state.get("missing_days") if isinstance(state.get("missing_days"), list) else []
+    miss = set(d for d in kept if _req_int(d))
+    if have and _req_int(today):
+        miss |= set(range(min(have), today))
+    miss = sorted(d for d in miss - have if today is None or d < today)[-4000:]
+    ms = set(miss)
+    state["missing_days"] = [d for d in kept if _req_int(d) and d in ms]
+    return miss
 
 
 def COUNTS(v):  # {label: count}, e.g. machines per continent
@@ -1317,6 +1344,161 @@ def build_awards(api, chain, state, now, wallets=None):
                                            "keys": dict(sorted(live.items()))},
         "balances": balances,
     }
+
+
+# ---- health.json (each machine's votes per 5 minutes, the last 24 hours) ----------
+# The "heartbeat" of every validating machine: how many chain votes its key cast in each
+# 5-minute bucket of the last 24 h. From the same node route as awards.json `live`:
+#   awards/network/day/{d}/blocks   every block of day d the node recorded, each with the
+#                                   votes it carries: {slot, key_id, key_code, account, w}
+# A vote is counted in the bucket of the slot it votes FOR (start_time + slot * slot_ms),
+# not of the block that carries it. A block carries votes for earlier slots only (1 to
+# ~15 slots back, measured 20 Nov 2026), so the blocks after slot S hold every vote for a
+# slot >= S: reading the blocks after the first bucket not yet kept recounts that bucket
+# and every later one from scratch.
+# Kept in the state file ("health"): the counts of each bucket that ended at least
+# HEALTH_SEAL_S before the chain's FINALIZED block (no reorganisation can change its
+# blocks, and votes for it arriving that late were never seen). So a normal run reads the
+# last ~45 minutes of blocks (one page); a first run, or one after the state was lost,
+# reads up to 24 h (about 13 pages, a few seconds).
+# null = unknown, never 0: a bucket before the chain started, or one that ends after the
+# node's newest block (a lagging node). Fail-closed: when this node did not record part
+# of the last 24 h (the node's `recorded` is "part" or "none" for a day in the window) the
+# file is not written at all: null buckets would show when this node started recording,
+# a hint about which machine it is (same reason as awards.json per-account counts).
+# Any error leaves health.json and the kept counts as they were.
+HEALTH_BUCKET_S = 300
+HEALTH_BUCKETS = 288
+HEALTH_SEAL_S = 1800
+HEALTH_PAGES = 40                      # 24 h is ~13 pages of 240 blocks: far beyond any run
+
+
+def build_health(api, chain, codes, state, now, live=None):
+    """health.json for the roster's machine `codes`, or None (and why on stderr)."""
+    def no(why):
+        print("health.json not written: %s" % why, file=sys.stderr)
+        return None
+    start, slot_ms = chain.get("start_time"), chain.get("slot_ms")
+    head = chain.get("head") or {}
+    if not _req_int(start) or not _req_int(slot_ms) or not slot_ms or not _req_int(head.get("time")):
+        return no("the chain's start, slot length or head is not usable")
+    codes = sorted(set(c for c in codes if CODE(c) is not _BAD))
+    if not codes:
+        return no("no validating machines")
+    B = HEALTH_BUCKET_S
+    end = now // B * B                 # the last bucket is the last whole 5 minutes
+    frm = end - HEALTH_BUCKETS * B
+    old = state.get("health")
+    old = old if isinstance(old, dict) and old.get("start_time") == start \
+        and old.get("bucket_s") == B and isinstance(old.get("sealed"), dict) else {}
+    # Kept compactly: one table of key codes, and per bucket its counts in that order.
+    table = old.get("codes") if isinstance(old.get("codes"), list) else []
+    if len(table) > 20000 or any(CODE(c) is _BAD for c in table):
+        table = []
+    sealed = {}
+    for k, v in (old.get("sealed") or {}).items() if table else ():
+        if isinstance(k, str) and k.isdigit() and len(k) <= 12 and frm <= int(k) < end \
+                and int(k) % B == 0 and (v is None or (isinstance(v, list) and len(v) <= len(table)
+                                                       and all(_req_int(n) for n in v))):
+            sealed[int(k)] = None if v is None else {table[i]: n for i, n in enumerate(v) if n}
+    todo = [b for b in range(frm, end, B) if b not in sealed]
+    counts = {b: {} for b in todo}
+    unknown = set()
+    rows_seen, recent = 0, set()
+    if todo:
+        lo_ms = todo[0] * 1000
+        s0 = max(0, -(-(lo_ms - start) // slot_ms))      # first slot at or after lo_ms
+        after = s0 - 1
+        pages, seen = 0, set()
+        for d in range((start + s0 * slot_ms) // 86400000, now // 86400 + 1):
+            a = after
+            while True:
+                pages += 1
+                if pages > HEALTH_PAGES:
+                    return no("more than %d pages of blocks" % HEALTH_PAGES)
+                try:
+                    page = get(api, "awards/network/day/%d/blocks?limit=240%s" % (
+                        d, "" if a < 0 else "&after_slot=%d" % a))
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:  # a day the chain does not have (before its start)
+                        if d * 86400000 >= head["time"]:
+                            break      # after the head: covered by the head rule below
+                        unknown.update(b for b in todo if b * 1000 < (d + 1) * 86400000
+                                       and (b + B) * 1000 > d * 86400000)
+                        break
+                    raise
+                if not isinstance(page, dict) or page.get("day") != d \
+                        or not isinstance(page.get("rows"), list):
+                    return no("the node's blocks answer has an unexpected shape")
+                if page.get("recorded") != "all":
+                    return no("this node did not record all of day %d (%r)" % (d, page.get("recorded")))
+                for r in page["rows"]:
+                    if not isinstance(r, dict) or not _req_int(r.get("slot")) \
+                            or not _req_int(r.get("time")) or not isinstance(r.get("votes"), list):
+                        return no("a block row has an unexpected shape")
+                    rows_seen += 1
+                    if r["time"] >= (now - LIVE_WINDOW_S) * 1000:
+                        for x in [r.get("proposer")] + r["votes"]:
+                            c = x.get("key_code") if isinstance(x, dict) else None
+                            if CODE(c) is not _BAD:
+                                recent.add(c)
+                    for v in r["votes"]:
+                        c = v.get("key_code") if isinstance(v, dict) else None
+                        vs = v.get("slot") if isinstance(v, dict) else None
+                        if CODE(c) is _BAD or not _req_int(vs) or vs >= r["slot"]:
+                            return no("a vote has an unexpected shape")
+                        if (c, vs) in seen:
+                            continue   # one vote per key and slot
+                        seen.add((c, vs))
+                        b = (start + vs * slot_ms) // 1000 // B * B
+                        if b in counts:
+                            counts[b][c] = counts[b].get(c, 0) + 1
+                nxt = page.get("next_after_slot")
+                if nxt is None or not page["rows"]:
+                    break
+                if not _req_int(nxt) or nxt <= a:
+                    return no("the node's blocks paging went backwards")
+                a = nxt
+    # Unknown: before the chain's first slot, and any bucket that ends after the node's
+    # newest block (a lagging node, or a bucket the head has not reached the end of yet).
+    for b in todo:
+        if (b + B) * 1000 <= start or (b + B) * 1000 > head["time"]:
+            unknown.add(b)
+    final = ((chain.get("finalized") or {}).get("time"))
+    seal_before = (final // 1000 - HEALTH_SEAL_S) if _req_int(final) else None
+    keep = dict(sealed)
+    for b in todo:
+        if seal_before is not None and b + B <= seal_before and b + B <= now - HEALTH_SEAL_S:
+            keep[b] = None if b in unknown else counts[b]
+    if isinstance(live, dict) and isinstance(live.get("keys"), dict) and rows_seen:
+        lk = set(live["keys"])
+        if lk != recent:
+            print("health.json: the last %d s differ from awards.json live.keys (%d only there, %d only here)"
+                  % (LIVE_WINDOW_S, len(lk - recent), len(recent - lk)), file=sys.stderr)
+    machines = {}
+    for c in codes:
+        row = []
+        for b in range(frm, end, B):
+            if b in sealed:
+                v = sealed[b]
+            else:
+                v = None if b in unknown else counts[b]
+            row.append(None if v is None else v.get(c, 0))
+        machines[c] = row
+    table = sorted(set(c for v in keep.values() if v for c in v))
+    pos = {c: i for i, c in enumerate(table)}
+
+    def packed(v):
+        row = [0] * len(table)
+        for c, n in v.items():
+            row[pos[c]] = n
+        while row and not row[-1]:
+            row.pop()
+        return row
+    state["health"] = {"start_time": start, "bucket_s": B, "codes": table,
+                       "sealed": {str(b): None if v is None else packed(v)
+                                  for b, v in sorted(keep.items())}}
+    return {"generated_unix": now, "bucket_s": B, "from_unix": frm, "machines": machines}
 
 
 # ---- awards.json "balances" (per-account chain balances, validator rc.19) ----------
@@ -2112,6 +2294,18 @@ def main():
         print("awards.json not written: %s" % type(e).__name__, file=sys.stderr)
     if awards:
         write_json(os.path.join(out, "awards.json"), awards)
+    # Votes per machine per 5 minutes (see build_health). Optional, like blocks.json.
+    health = None
+    try:
+        health = build_health(a.api, chain, [m.get("code") for x in vals["accounts"]
+                                             for m in x.get("machines") or []
+                                             if isinstance(m, dict)],
+                              state, int(time.time()),
+                              live=(awards or {}).get("live")) if (chain and vals) else None
+    except Exception as e:             # never let this optional file stop the others
+        print("health.json not written: %s" % type(e).__name__, file=sys.stderr)
+    if health:
+        write_json(os.path.join(out, "health.json"), health)
     if vals:
         try:
             update_handles(state, [x["wallet"].lower() for x in vals["accounts"]], int(time.time()))
@@ -2147,12 +2341,13 @@ def main():
 
     for what in sorted(_dropped - KNOWN_UNPUBLISHED):
         print("not published: %s" % what, file=sys.stderr)
-    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s%s%s%s%s" % (
+    print("ok: %d cycles, latest certified %s, %s validator accounts, chain %s%s%s%s%s%s" % (
         len(index), network.get("latest_certified_day"), len(vals["accounts"]) if vals else 0,
         "%s at height %s" % (chain.get("state"), (chain.get("head") or {}).get("height")) if chain else "-",
         ", wrote day %d" % wrote_day if wrote_day else "",
         ", history %d days" % len(history["days"]) if history else "",
         ", awards %d days" % len(awards["days"]) if awards else "",
+        ", health %d machines" % len(health["machines"]) if health else "",
         ", balances %d accounts" % len(awards["balances"]["accounts"])
         if awards and awards.get("balances") else ""))
     return 0

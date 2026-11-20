@@ -419,6 +419,7 @@ class SignNames(unittest.TestCase):
         root = tempfile.mkdtemp()
         try:
             for n in ("network.json", "history.json", "awards.json", "releases.json", "releases.json.sig",
+                      "health.json", "health.json.tmp",
                       "own.json", "days/index.json",
                       "days/20771.json", "days/x.json", "days/20771.json.tmp", "cycles/20771.json",
                       "other/1.json"):
@@ -427,7 +428,8 @@ class SignNames(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("{}")
             self.assertEqual(sign.data_files(root), [
-                "awards.json", "history.json", "network.json", "releases.json", "cycles/20771.json",
+                "awards.json", "health.json", "history.json", "network.json", "releases.json",
+                "cycles/20771.json",
                 "days/20771.json", "days/index.json"])
             shutil.rmtree(os.path.join(root, "days"))
             os.symlink(os.path.join(root, "cycles"), os.path.join(root, "days"))
@@ -796,6 +798,220 @@ class Signing(unittest.TestCase):
         v = vals(20774, [self.acct(W1, self.m("0000000a", "NOT_YET", 20770, 4, 20773))])
         self.assertEqual(self.run_day(st, v), {W1: (4, 4)})
         self.assertEqual(set(st["sign_counts"]), {W1})
+
+
+class BlocksNode(object):
+    """Answers awards/network/day/{d}/blocks like the node: rows with slot > after_slot,
+    oldest first, `limit` per page, from one list of blocks."""
+
+    def __init__(self, start, slot_ms, rows, recorded=None, first_day=None):
+        self.start, self.slot_ms, self.rows = start, slot_ms, rows
+        self.recorded, self.first_day, self.asked = recorded or {}, first_day, []
+
+    def __call__(self, api, path, timeout=20):
+        import re
+        import urllib.error
+        self.asked.append(path)
+        m = re.match(r"^awards/network/day/(\d+)/blocks\?limit=(\d+)(?:&after_slot=(\d+))?$", path)
+        if not m:
+            raise urllib.error.HTTPError(path, 404, "not found", {}, None)
+        d, limit = int(m.group(1)), int(m.group(2))
+        after = int(m.group(3)) if m.group(3) else -1
+        if self.first_day is not None and d < self.first_day:
+            raise urllib.error.HTTPError(path, 404, "not found", {}, None)
+        day_rows = [r for r in self.rows if r["time"] // 86400000 == d and r["slot"] > after]
+        page = day_rows[:limit]
+        return json.loads(json.dumps({
+            "day": d, "recorded": self.recorded.get(d, "all"), "rows": page,
+            "next_after_slot": page[-1]["slot"] if len(day_rows) > limit else None}))
+
+
+HSTART = 1794571200000                 # day 20770 at noon, as on the real chain
+
+
+def hrow(start, slot, votes, final=True, proposer="000000aa"):
+    """A block at `slot` carrying `votes` = [(key_code, voted_slot), ...]."""
+    return {"slot": slot, "time": start + slot * 30000, "height": slot, "root": "0x" + "1" * 64,
+            "final": final, "proposer": {"key_code": proposer, "key_id": "0x" + "2" * 64},
+            "votes": [{"slot": s, "key_code": c, "key_id": "0x" + "3" * 64, "account": W1, "w": "5"}
+                      for c, s in votes]}
+
+
+def hchain(start, head_slot, final_slot):
+    return {"start_time": start, "slot_ms": 30000,
+            "head": {"slot": head_slot, "time": start + head_slot * 30000},
+            "finalized": {"slot": final_slot, "time": start + final_slot * 30000}}
+
+
+class Health(unittest.TestCase):
+    def setUp(self):
+        self.real_get = collect.get
+
+    def tearDown(self):
+        collect.get = self.real_get
+
+    def slot_at(self, unix, start=HSTART):
+        return (unix * 1000 - start) // 30000
+
+    def test_counts_by_voted_slot_nulls_and_shape(self):
+        # A chain that started 2 hours before NOW: everything before is unknown (null).
+        start = (NOW - 7200) // 300 * 300 * 1000
+        head = self.slot_at(NOW - 20, start)
+        rows = []
+        for s in range(1, head + 1):
+            votes = [("0000000a", s - 1)]                      # a votes for every slot
+            if s % 2 == 0:
+                votes.append(("0000000b", s - 2))              # b for every other slot
+            rows.append(hrow(start, s, votes))
+        rows[5]["votes"].append(dict(rows[4]["votes"][0]))     # a vote seen twice counts once
+        collect.get = BlocksNode(start, 30000, rows, first_day=start // 86400000)
+        st = {}
+        h = collect.build_health("x", hchain(start, head, head - 20),
+                                 ["0000000a", "0000000b", "0000000c", "BAD"], st, NOW)
+        self.assertEqual(set(h), {"generated_unix", "bucket_s", "from_unix", "machines"})
+        self.assertEqual(h["bucket_s"], 300)
+        self.assertEqual(h["from_unix"] % 300, 0)
+        self.assertEqual(h["from_unix"], NOW // 300 * 300 - 86400)
+        self.assertEqual(sorted(h["machines"]), ["0000000a", "0000000b", "0000000c"])
+        a, b, c = (h["machines"][k] for k in ("0000000a", "0000000b", "0000000c"))
+        self.assertEqual(len(a), 288)
+        first = (start // 1000 - h["from_unix"]) // 300         # the chain's first bucket
+        self.assertTrue(all(x is None for x in a[:first]))      # before the chain: unknown
+        self.assertEqual(a[first:first + 22], [10] * 22)        # 10 slots per 5 minutes
+        self.assertEqual(b[first:first + 22], [5] * 22)
+        self.assertEqual(c[first:first + 22], [0] * 22)         # known and silent: 0, not null
+        self.assertEqual(a[-1], 10)
+
+    def test_after_the_head_is_unknown(self):
+        head = self.slot_at(NOW - 1000)                        # the node lags ~17 minutes
+        rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
+        collect.get = BlocksNode(HSTART, 30000, rows)
+        h = collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW)
+        a = h["machines"]["0000000a"]
+        self.assertEqual(a[-3:], [None, None, None])           # the head is inside the first
+        self.assertEqual(a[-4], 10)                            # ... of these: unknown too
+
+    def test_kept_buckets_make_the_next_run_small_and_identical(self):
+        head = self.slot_at(NOW - 15)
+        rows = [hrow(HSTART, s, [("0000000a", s - 1), ("0000000b", s - 3)]) for s in range(head - 3000, head + 1)]
+        node = BlocksNode(HSTART, 30000, rows)
+        collect.get = node
+        st = {}
+        ch = hchain(HSTART, head, head - 20)
+        h1 = collect.build_health("x", ch, ["0000000a", "0000000b"], st, NOW)
+        first_run = len(node.asked)
+        self.assertGreater(first_run, 10)                       # 24 h: many pages
+        self.assertIn("health", st)
+        self.assertLessEqual(len(json.dumps(st)), 20000)
+        node.asked.clear()
+        h2 = collect.build_health("x", ch, ["0000000a", "0000000b"], st, NOW + 5)
+        self.assertEqual(h1["machines"], h2["machines"])
+        self.assertLessEqual(len(node.asked), 2)                 # only the last ~45 minutes
+        # a kept bucket is never recounted: a late change to an old block is not seen
+        st2 = json.loads(json.dumps(st))
+        for r in rows[:500]:
+            r["votes"] = []
+        h3 = collect.build_health("x", ch, ["0000000a", "0000000b"], st2, NOW + 5)
+        self.assertEqual(h1["machines"], h3["machines"])
+        # another chain start: the kept counts are dropped and everything is read again
+        node.asked.clear()
+        st3 = json.loads(json.dumps(st))
+        st3["health"]["start_time"] = HSTART + 1
+        collect.build_health("x", ch, ["0000000a", "0000000b"], st3, NOW + 5)
+        self.assertGreater(len(node.asked), 10)
+
+    def test_fail_closed(self):
+        head = self.slot_at(NOW - 15)
+        day = (HSTART + head * 30000) // 86400000
+        rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
+        ch = hchain(HSTART, head, head - 20)
+        # a day in the window this node recorded only in part: nothing (not nulls)
+        collect.get = BlocksNode(HSTART, 30000, rows, recorded={day - 1: "part"})
+        st = {"health": "untouched"}
+        self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
+        self.assertEqual(st, {"health": "untouched"})
+        # a vote of an unexpected form
+        bad = json.loads(json.dumps(rows))
+        bad[-1]["votes"][0]["key_code"] = "nothex!!"
+        collect.get = BlocksNode(HSTART, 30000, bad)
+        self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
+        # a vote for the block's own slot or later is not a vote this route returns
+        bad = json.loads(json.dumps(rows))
+        bad[-1]["votes"][0]["slot"] = bad[-1]["slot"]
+        collect.get = BlocksNode(HSTART, 30000, bad)
+        self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
+        # too many pages
+        collect.get = BlocksNode(HSTART, 30000, rows)
+        real = collect.HEALTH_PAGES
+        collect.HEALTH_PAGES = 3
+        try:
+            self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
+        finally:
+            collect.HEALTH_PAGES = real
+        # no roster, no chain figures
+        self.assertIsNone(collect.build_health("x", ch, [], st, NOW))
+        self.assertIsNone(collect.build_health("x", {"slot_ms": 30000}, ["0000000a"], st, NOW))
+        self.assertEqual(st, {"health": "untouched"})
+
+    def test_live_cross_check_is_logged(self):
+        import io
+        head = self.slot_at(NOW - 15)
+        rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
+        collect.get = BlocksNode(HSTART, 30000, rows)
+        err, real = io.StringIO(), sys.stderr
+        sys.stderr = err
+        try:
+            collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW,
+                                 live={"keys": {"0000000a": NOW, "000000aa": NOW}})
+            self.assertEqual(err.getvalue(), "")                 # the proposer counts in live
+            collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW,
+                                 live={"keys": {"0000000f": NOW}})
+        finally:
+            sys.stderr = real
+        self.assertIn("differ from awards.json live.keys (1 only there, 2 only here)", err.getvalue())
+
+
+class MissingDays(unittest.TestCase):
+    def setUp(self):
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.out)
+
+    def test_skipped_days_are_listed_never_made_up(self):
+        st = {}
+        a = [{"wallet": W1, "tdh": 1, "weight": 1, "machines": [machine("0000000a")]}]
+        collect.roll_day(self.out, st, vals(20770, a))
+        self.assertEqual(collect.roll_day(self.out, st, vals(20774, a)), 20770)   # 3 days unseen
+        self.assertEqual(collect.day_files(self.out), {20770})                   # none made up
+        today = collect.day_record(vals(20774, a), st)
+        h = collect.build_history(self.out, st, today, NOW)
+        self.assertEqual(h["missing_days"], [20771, 20772, 20773])
+        self.assertEqual([r["day"] for r in h["days"]], [20770, 20774])
+        # one of them filled in later (a manual backfill): no longer missing
+        collect.write_day(self.out, collect.day_record(vals(20772, a), st))
+        h = collect.build_history(self.out, st, today, NOW)
+        self.assertEqual(h["missing_days"], [20771, 20773])
+        self.assertEqual(st["missing_days"], [20771, 20773])
+
+    def test_gap_in_the_archive_without_state(self):
+        st = {}
+        a = [{"wallet": W1, "tdh": 1, "weight": 1, "machines": [machine("0000000a")]}]
+        for d in (20770, 20773):
+            collect.write_day(self.out, collect.day_record(vals(d, a), st))
+        today = collect.day_record(vals(20775, a), st)
+        h = collect.build_history(self.out, st, today, NOW)
+        self.assertEqual(h["missing_days"], [20771, 20772, 20774])
+        h = collect.build_history(self.out, {}, None, NOW)       # no list today: nothing guessed
+        self.assertEqual(h["missing_days"], [])
+
+    def test_no_gap(self):
+        st = {}
+        a = [{"wallet": W1, "tdh": 1, "weight": 1, "machines": [machine("0000000a")]}]
+        collect.roll_day(self.out, st, vals(20770, a))
+        collect.roll_day(self.out, st, vals(20771, a))
+        h = collect.build_history(self.out, st, collect.day_record(vals(20771, a), st), NOW)
+        self.assertEqual(h["missing_days"], [])
 
 
 class HeadRecent(unittest.TestCase):
