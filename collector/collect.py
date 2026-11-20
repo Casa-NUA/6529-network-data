@@ -1381,6 +1381,11 @@ HEALTH_MINUTE_S = 60
 HEALTH_MINUTES = 1440
 HEALTH_SEAL_S = 1800
 HEALTH_PAGES = 40                      # 24 h is ~13 pages of 240 blocks: far beyond any run
+# Votes for a slot reach blocks up to ~14 slots later (measured 20 Nov 2026: 20% of a
+# minute's votes are not in any block yet when the head passes the minute's end, none
+# after 7 minutes). A minute stays unknown until the head is this many slots past it,
+# so the newest minutes never show a false 0.
+HEALTH_SETTLE_SLOTS = 15
 
 
 def _bits_b64(n, ones):
@@ -1453,6 +1458,8 @@ def build_health(api, chain, codes, state, now, live=None):
         s0 = max(0, -(-(lo_ms - start) // slot_ms))      # first slot at or after lo_ms
         after = s0 - 1
         pages, seen = 0, set()
+        prev_h = None                  # heights must follow each other: a missing block
+                                       # would read as minutes without votes
         for d in range((start + s0 * slot_ms) // 86400000, now // 86400 + 1):
             a = after
             while True:
@@ -1479,6 +1486,11 @@ def build_health(api, chain, codes, state, now, live=None):
                     if not isinstance(r, dict) or not _req_int(r.get("slot")) \
                             or not _req_int(r.get("time")) or not isinstance(r.get("votes"), list):
                         return no("a block row has an unexpected shape")
+                    h = r.get("height")
+                    if _req_int(h):
+                        if prev_h is not None and h != prev_h + 1:
+                            return no("the node's blocks skip from height %d to %d" % (prev_h, h))
+                        prev_h = h
                     rows_seen += 1
                     if r["time"] >= (now - LIVE_WINDOW_S) * 1000:
                         for x in [r.get("proposer")] + r["votes"]:
@@ -1502,10 +1514,11 @@ def build_health(api, chain, codes, state, now, live=None):
                 if not _req_int(nxt) or nxt <= a:
                     return no("the node's blocks paging went backwards")
                 a = nxt
-    # Unknown: before the chain's first slot, and any minute that ends after the node's
-    # newest block (a lagging node, or the minute the head has not reached the end of yet).
+    # Unknown: before the chain's first slot, and any minute whose votes may still be on
+    # their way (it ends less than HEALTH_SETTLE_SLOTS before the node's newest block: a
+    # lagging node, or the newest minutes, whose votes later blocks still carry).
     for t in todo:
-        if (t + M) * 1000 <= start or (t + M) * 1000 > head["time"]:
+        if (t + M) * 1000 <= start or (t + M) * 1000 + HEALTH_SETTLE_SLOTS * slot_ms > head["time"]:
             unknown.add(t)
     for c in hit:
         hit[c] -= unknown

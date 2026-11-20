@@ -889,9 +889,15 @@ class Health(unittest.TestCase):
         known = bits(h["known"])
         a, b, c = (bits(h["machines"][k]) for k in ("0000000a", "0000000b", "0000000c"))
         first = (start // 1000 - h["from_unix"]) // 60          # the chain's first minute
-        self.assertEqual(known, [0] * first + [1] * (1440 - first))
-        self.assertEqual(a, [0] * first + [1] * (1440 - first))  # every minute
-        self.assertEqual(sum(b[first:]), len(range(5, head - 2, 8)))
+        # settling: a minute is known once the head is 15 slots (450 s) past its end
+        head_t = (start + head * 30000) // 1000
+        last = sum(1 for i in range(1440) if h["from_unix"] + 60 * (i + 1) + 450 <= head_t)
+        self.assertEqual(last, 1440 - 8)                        # head 20 s ago: the newest 8
+        self.assertEqual(known, [0] * first + [1] * (last - first) + [0] * (1440 - last))
+        self.assertEqual(a, known)                              # every known minute
+        b_minutes = {(start + vs * 30000) // 60000 * 60 for vs in range(5, head - 2, 8)}
+        self.assertEqual(sum(b[first:]), sum(1 for t in b_minutes
+                                             if t + 60 + 450 <= head_t))
         self.assertEqual(sum(c), 0)                             # silent: known, no bit
 
     def test_after_the_head_is_unknown(self):
@@ -900,8 +906,43 @@ class Health(unittest.TestCase):
         collect.get = BlocksNode(HSTART, 30000, rows)
         h = collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW)
         known, a = bits(h["known"]), bits(h["machines"]["0000000a"])
-        self.assertEqual(known[-4:], [1, 0, 0, 0])             # the head is in the 3rd last
-        self.assertEqual(a[-4:], [1, 0, 0, 0])
+        head_t = (HSTART + head * 30000) // 1000
+        n_known = sum(1 for i in range(1440) if h["from_unix"] + 60 * (i + 1) + 450 <= head_t)
+        self.assertIn(1440 - n_known, (11, 12))                 # 3 minutes behind + 7.5 settling
+        self.assertEqual(known, [1] * n_known + [0] * (1440 - n_known))
+        self.assertEqual(a, known)
+
+    def test_late_votes_never_read_as_zero(self):
+        # Real chain, 20 Nov 2026: votes for a slot arrive in blocks up to ~14 slots later.
+        # Machine b votes once, for a slot in the minute just before the head, and the
+        # block carrying it is not out yet: that minute must be unknown, not a 0.
+        head = self.slot_at(NOW - 10)
+        rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
+        collect.get = BlocksNode(HSTART, 30000, rows)
+        h = collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a", "0000000b"], {}, NOW)
+        known = bits(h["known"])
+        head_t = (HSTART + head * 30000) // 1000
+        for i in range(1440):
+            if h["from_unix"] + 60 * (i + 1) > head_t - 450:
+                self.assertEqual(known[i], 0, i)                # still settling
+        # once later blocks carry the vote (b, 12 slots late), its minute shows it
+        late = head - 2
+        rows2 = rows + [hrow(HSTART, s, [("0000000a", s - 1)] + ([("0000000b", late)] if s == late + 12 else []))
+                        for s in range(head + 1, head + 40)]
+        collect.get = BlocksNode(HSTART, 30000, rows2)
+        h2 = collect.build_health("x", hchain(HSTART, head + 39, head + 19), ["0000000a", "0000000b"], {}, NOW + 1200)
+        t = (HSTART + late * 30000) // 60000 * 60
+        i = (t - h2["from_unix"]) // 60
+        self.assertEqual((bits(h2["known"])[i], bits(h2["machines"]["0000000b"])[i]), (1, 1))
+
+    def test_missing_block_heights_fail_closed(self):
+        head = self.slot_at(NOW - 15)
+        rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
+        del rows[-1500]                                         # the node lacks one block
+        collect.get = BlocksNode(HSTART, 30000, rows)
+        st = {"health": "untouched"}
+        self.assertIsNone(collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], st, NOW))
+        self.assertEqual(st, {"health": "untouched"})
 
     def test_kept_minutes_make_the_next_run_small_and_identical(self):
         head = self.slot_at(NOW - 15)
