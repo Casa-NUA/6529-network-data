@@ -935,14 +935,25 @@ class Health(unittest.TestCase):
         i = (t - h2["from_unix"]) // 60
         self.assertEqual((bits(h2["known"])[i], bits(h2["machines"]["0000000b"])[i]), (1, 1))
 
-    def test_missing_block_heights_fail_closed(self):
+    def test_missing_blocks_are_a_gap_not_silence(self):
         head = self.slot_at(NOW - 15)
         rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
+        gone = rows[-1500]["slot"]
         del rows[-1500]                                         # the node lacks one block
         collect.get = BlocksNode(HSTART, 30000, rows)
-        st = {"health": "untouched"}
-        self.assertIsNone(collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], st, NOW))
-        self.assertEqual(st, {"health": "untouched"})
+        h = collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW)
+        known, a = bits(h["known"]), bits(h["machines"]["0000000a"])
+        i = ((HSTART + (gone - 1) * 30000) // 60000 * 60 - h["from_unix"]) // 60
+        self.assertEqual((known[i], a[i]), (0, 0))              # the missing vote's minute: a gap
+        lo = ((HSTART + (gone - 16) * 30000) // 60000 * 60 - h["from_unix"]) // 60
+        self.assertEqual(known[lo - 2:lo], [1, 1])              # well before it: known
+        self.assertEqual(sum(1 for k in known[lo - 2:i + 3] if not k), len(range(lo, i + 1)) + (known[i + 1] == 0) + (known[i + 2] == 0))
+        self.assertLessEqual(sum(1 for k in known[:-8] if not k), 10)   # only around the hole
+        self.assertTrue(all(a[j] == known[j] for j in range(1440)))      # no false 0 anywhere
+        # heights going backwards: nothing written
+        bad = json.loads(json.dumps(rows)); bad[-1]["height"] = 5
+        collect.get = BlocksNode(HSTART, 30000, bad)
+        self.assertIsNone(collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW))
 
     def test_kept_minutes_make_the_next_run_small_and_identical(self):
         head = self.slot_at(NOW - 15)

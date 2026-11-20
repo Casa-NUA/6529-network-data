@@ -1458,8 +1458,9 @@ def build_health(api, chain, codes, state, now, live=None):
         s0 = max(0, -(-(lo_ms - start) // slot_ms))      # first slot at or after lo_ms
         after = s0 - 1
         pages, seen = 0, set()
-        prev_h = None                  # heights must follow each other: a missing block
-                                       # would read as minutes without votes
+        prev_h = prev_s = None         # heights follow each other; where this node lacks
+        holes = []                     # blocks, the votes they carried are not seen: those
+                                       # minutes become unknown (a gap), never a 0
         for d in range((start + s0 * slot_ms) // 86400000, now // 86400 + 1):
             a = after
             while True:
@@ -1489,8 +1490,14 @@ def build_health(api, chain, codes, state, now, live=None):
                     h = r.get("height")
                     if _req_int(h):
                         if prev_h is not None and h != prev_h + 1:
-                            return no("the node's blocks skip from height %d to %d" % (prev_h, h))
-                        prev_h = h
+                            if h <= prev_h:
+                                return no("the node's blocks go back from height %d to %d" % (prev_h, h))
+                            # The missing blocks sat between the two slots and carried votes
+                            # for slots up to HEALTH_SETTLE_SLOTS before them.
+                            holes.append((prev_s - HEALTH_SETTLE_SLOTS, r["slot"]))
+                            print("health.json: this node lacks blocks %d to %d (a gap)" % (prev_h + 1, h - 1),
+                                  file=sys.stderr)
+                        prev_h, prev_s = h, r["slot"]
                     rows_seen += 1
                     if r["time"] >= (now - LIVE_WINDOW_S) * 1000:
                         for x in [r.get("proposer")] + r["votes"]:
@@ -1520,6 +1527,9 @@ def build_health(api, chain, codes, state, now, live=None):
     for t in todo:
         if (t + M) * 1000 <= start or (t + M) * 1000 + HEALTH_SETTLE_SLOTS * slot_ms > head["time"]:
             unknown.add(t)
+    for lo, hi in holes:
+        a_ms, b_ms = start + lo * slot_ms, start + (hi + 1) * slot_ms
+        unknown.update(t for t in todo if t * 1000 < b_ms and (t + M) * 1000 > a_ms)
     for c in hit:
         hit[c] -= unknown
     if isinstance(live, dict) and isinstance(live.get("keys"), dict) and rows_seen:
