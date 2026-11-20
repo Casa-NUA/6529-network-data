@@ -25,8 +25,8 @@ day's validator list), history.json (network size and software per day) and
 awards.json (the chain's per-account awards over the last days, from the node's
 awards/network routes, and which keys proposed or voted in the last 10 minutes; from
 rc.19 also each validating account's balance, vesting and earned total, read in
-rotation from chain/account/<wallet>), health.json (from 20 Nov 2026: each machine's
-votes per 5 minutes over the last 24 h, from the same blocks route), and
+rotation from chain/account/<wallet>), health.json (from 20 Nov 2026: per machine, the
+minutes of the last 24 h in which it voted, from the same blocks route), and
 adds each account's public 6529 handle (from api.6529.io) to validators.json. From
 18 Nov 2026 it also republishes 6529's signed release feed as releases.json once its
 signature verifies, and adds network.json `crosscheck` ("6529 agrees", against
@@ -41,6 +41,7 @@ Python 3.9+, standard library only.
                        [--state /path/outside/data/collector-state.json]
 """
 import argparse
+import base64
 import calendar
 import glob
 import hashlib
@@ -1346,31 +1347,61 @@ def build_awards(api, chain, state, now, wallets=None):
     }
 
 
-# ---- health.json (each machine's votes per 5 minutes, the last 24 hours) ----------
-# The "heartbeat" of every validating machine: how many chain votes its key cast in each
-# 5-minute bucket of the last 24 h. From the same node route as awards.json `live`:
+# ---- health.json (each machine's vote "pulse", minute by minute, the last 24 hours) ---
+# For every validating machine: in which minutes of the last 24 h its key cast at least one
+# chain vote. From the same node route as awards.json `live`:
 #   awards/network/day/{d}/blocks   every block of day d the node recorded, each with the
 #                                   votes it carries: {slot, key_id, key_code, account, w}
-# A vote is counted in the bucket of the slot it votes FOR (start_time + slot * slot_ms),
-# not of the block that carries it. A block carries votes for earlier slots only (1 to
-# ~15 slots back, measured 20 Nov 2026), so the blocks after slot S hold every vote for a
-# slot >= S: reading the blocks after the first bucket not yet kept recounts that bucket
-# and every later one from scratch.
-# Kept in the state file ("health"): the counts of each bucket that ended at least
-# HEALTH_SEAL_S before the chain's FINALIZED block (no reorganisation can change its
-# blocks, and votes for it arriving that late were never seen). So a normal run reads the
-# last ~45 minutes of blocks (one page); a first run, or one after the state was lost,
-# reads up to 24 h (about 13 pages, a few seconds).
-# null = unknown, never 0: a bucket before the chain started, or one that ends after the
-# node's newest block (a lagging node). Fail-closed: when this node did not record part
-# of the last 24 h (the node's `recorded` is "part" or "none" for a day in the window) the
-# file is not written at all: null buckets would show when this node started recording,
-# a hint about which machine it is (same reason as awards.json per-account counts).
-# Any error leaves health.json and the kept counts as they were.
-HEALTH_BUCKET_S = 300
-HEALTH_BUCKETS = 288
+# A vote counts in the minute of the slot it votes FOR (start_time + slot * slot_ms), not
+# of the block that carries it, whatever its weight. A block carries votes for earlier
+# slots only (1 to ~15 slots back, measured 20 Nov 2026), so the blocks after slot S hold
+# every vote for a slot >= S: reading the blocks from the first minute not yet kept
+# recounts that minute and every later one from scratch.
+#
+# File: {"generated_unix", "minute_s": 60, "from_unix", "minutes": 1440, "known": <b64>,
+#        "machines": {"<key code>": <b64>}}. Each <b64> is a 1440-bit bitmap (180 bytes,
+# standard base64 with padding): bit i is minute [from_unix + 60*i, from_unix + 60*(i+1)),
+# bit i is in byte i // 8, most significant bit first (bit i set <=> byte[i >> 3] &
+# (0x80 >> (i & 7))). `known` bit 1 = that minute is covered by fully recorded data; 0 =
+# unknown (before the chain started, or a minute that ends after the node's newest block).
+# A machine's bit 1 = at least one vote of its key for a slot in that minute; 0 in a known
+# minute = no vote; in an unknown minute always 0 (read it as "no data", not "no vote").
+# The last minute is the last whole minute before generated_unix.
+#
+# Kept in the state file ("health"): the minutes that ended at least HEALTH_SEAL_S before
+# the chain's FINALIZED block (no reorganisation can change their blocks, and votes for them
+# arriving that late were never seen), as one bitmap per key code over [base, upto). So a
+# normal run reads the last ~45 minutes of blocks (one page); a first run, or one after the
+# state was lost, reads up to 24 h (about 13 pages, a few seconds).
+# Fail-closed: when this node did not record part of a chain day in the window (the node's
+# `recorded` is "part" or "none") the file is not written at all: unknown minutes would show
+# when this node started recording, a hint about which machine it is (same reason as
+# awards.json per-account counts). Any error leaves health.json and the kept state as they were.
+HEALTH_MINUTE_S = 60
+HEALTH_MINUTES = 1440
 HEALTH_SEAL_S = 1800
 HEALTH_PAGES = 40                      # 24 h is ~13 pages of 240 blocks: far beyond any run
+
+
+def _bits_b64(n, ones):
+    """Base64 of an n-bit bitmap, MSB first, with bit i set for each i in `ones`."""
+    buf = bytearray((n + 7) // 8)
+    for i in ones:
+        buf[i >> 3] |= 0x80 >> (i & 7)
+    return base64.b64encode(bytes(buf)).decode("ascii")
+
+
+def _b64_bits(s, n):
+    """The set bit indexes of an n-bit bitmap from _bits_b64, or None if malformed."""
+    if not isinstance(s, str) or len(s) > 4 * ((n + 7) // 8 + 2) // 3 + 4:
+        return None
+    try:
+        buf = base64.b64decode(s.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return None
+    if len(buf) != (n + 7) // 8:
+        return None
+    return set(i for i in range(n) if buf[i >> 3] & (0x80 >> (i & 7)))
 
 
 def build_health(api, chain, codes, state, now, live=None):
@@ -1385,24 +1416,36 @@ def build_health(api, chain, codes, state, now, live=None):
     codes = sorted(set(c for c in codes if CODE(c) is not _BAD))
     if not codes:
         return no("no validating machines")
-    B = HEALTH_BUCKET_S
-    end = now // B * B                 # the last bucket is the last whole 5 minutes
-    frm = end - HEALTH_BUCKETS * B
+    M = HEALTH_MINUTE_S
+    end = now // M * M                 # the last minute is the last whole minute
+    frm = end - HEALTH_MINUTES * M
+    # The kept minutes: [frm, upto), with the minutes in it that had a vote, per code, and
+    # the unknown ones. Anything malformed, or not covering frm, is dropped (read again).
     old = state.get("health")
     old = old if isinstance(old, dict) and old.get("start_time") == start \
-        and old.get("bucket_s") == B and isinstance(old.get("sealed"), dict) else {}
-    # Kept compactly: one table of key codes, and per bucket its counts in that order.
-    table = old.get("codes") if isinstance(old.get("codes"), list) else []
-    if len(table) > 20000 or any(CODE(c) is _BAD for c in table):
-        table = []
-    sealed = {}
-    for k, v in (old.get("sealed") or {}).items() if table else ():
-        if isinstance(k, str) and k.isdigit() and len(k) <= 12 and frm <= int(k) < end \
-                and int(k) % B == 0 and (v is None or (isinstance(v, list) and len(v) <= len(table)
-                                                       and all(_req_int(n) for n in v))):
-            sealed[int(k)] = None if v is None else {table[i]: n for i, n in enumerate(v) if n}
-    todo = [b for b in range(frm, end, B) if b not in sealed]
-    counts = {b: {} for b in todo}
+        and old.get("minute_s") == M else {}
+    base, upto = old.get("base"), old.get("upto")
+    voted, unknown_kept, upto_ok = {}, set(), frm
+    if _req_int(base) and _req_int(upto) and base % M == 0 and upto % M == 0 \
+            and base <= frm < upto <= end and (upto - base) // M <= 2 * HEALTH_MINUTES \
+            and isinstance(old.get("codes"), dict) and len(old["codes"]) <= 20000:
+        n = (upto - base) // M
+        unk = _b64_bits(old.get("unknown"), n)
+        per = {}
+        for c, s in old["codes"].items():
+            got = _b64_bits(s, n) if CODE(c) is not _BAD else None
+            if got is None:
+                per = None
+                break
+            per[c] = got
+        if unk is not None and per is not None:
+            skip = (frm - base) // M
+            for c, got in per.items():
+                voted[c] = set(base + i * M for i in got if i >= skip)
+            unknown_kept = set(base + i * M for i in unk if i >= skip)
+            upto_ok = upto
+    todo = list(range(upto_ok, end, M))
+    hit = {}                           # code -> minutes (unix) with a vote, for todo minutes
     unknown = set()
     rows_seen, recent = 0, set()
     if todo:
@@ -1423,8 +1466,8 @@ def build_health(api, chain, codes, state, now, live=None):
                     if e.code == 404:  # a day the chain does not have (before its start)
                         if d * 86400000 >= head["time"]:
                             break      # after the head: covered by the head rule below
-                        unknown.update(b for b in todo if b * 1000 < (d + 1) * 86400000
-                                       and (b + B) * 1000 > d * 86400000)
+                        unknown.update(t for t in todo if t * 1000 < (d + 1) * 86400000
+                                       and (t + M) * 1000 > d * 86400000)
                         break
                     raise
                 if not isinstance(page, dict) or page.get("day") != d \
@@ -1448,57 +1491,54 @@ def build_health(api, chain, codes, state, now, live=None):
                         if CODE(c) is _BAD or not _req_int(vs) or vs >= r["slot"]:
                             return no("a vote has an unexpected shape")
                         if (c, vs) in seen:
-                            continue   # one vote per key and slot
+                            continue
                         seen.add((c, vs))
-                        b = (start + vs * slot_ms) // 1000 // B * B
-                        if b in counts:
-                            counts[b][c] = counts[b].get(c, 0) + 1
+                        t = (start + vs * slot_ms) // 1000 // M * M
+                        if upto_ok <= t < end:
+                            hit.setdefault(c, set()).add(t)
                 nxt = page.get("next_after_slot")
                 if nxt is None or not page["rows"]:
                     break
                 if not _req_int(nxt) or nxt <= a:
                     return no("the node's blocks paging went backwards")
                 a = nxt
-    # Unknown: before the chain's first slot, and any bucket that ends after the node's
-    # newest block (a lagging node, or a bucket the head has not reached the end of yet).
-    for b in todo:
-        if (b + B) * 1000 <= start or (b + B) * 1000 > head["time"]:
-            unknown.add(b)
-    final = ((chain.get("finalized") or {}).get("time"))
-    seal_before = (final // 1000 - HEALTH_SEAL_S) if _req_int(final) else None
-    keep = dict(sealed)
-    for b in todo:
-        if seal_before is not None and b + B <= seal_before and b + B <= now - HEALTH_SEAL_S:
-            keep[b] = None if b in unknown else counts[b]
+    # Unknown: before the chain's first slot, and any minute that ends after the node's
+    # newest block (a lagging node, or the minute the head has not reached the end of yet).
+    for t in todo:
+        if (t + M) * 1000 <= start or (t + M) * 1000 > head["time"]:
+            unknown.add(t)
+    for c in hit:
+        hit[c] -= unknown
     if isinstance(live, dict) and isinstance(live.get("keys"), dict) and rows_seen:
         lk = set(live["keys"])
         if lk != recent:
             print("health.json: the last %d s differ from awards.json live.keys (%d only there, %d only here)"
                   % (LIVE_WINDOW_S, len(lk - recent), len(recent - lk)), file=sys.stderr)
+
+    all_unknown = unknown_kept | unknown
+
+    def index(ts, lo, n):
+        return [(t - lo) // M for t in ts if lo <= t < lo + n * M]
     machines = {}
     for c in codes:
-        row = []
-        for b in range(frm, end, B):
-            if b in sealed:
-                v = sealed[b]
-            else:
-                v = None if b in unknown else counts[b]
-            row.append(None if v is None else v.get(c, 0))
-        machines[c] = row
-    table = sorted(set(c for v in keep.values() if v for c in v))
-    pos = {c: i for i, c in enumerate(table)}
-
-    def packed(v):
-        row = [0] * len(table)
-        for c, n in v.items():
-            row[pos[c]] = n
-        while row and not row[-1]:
-            row.pop()
-        return row
-    state["health"] = {"start_time": start, "bucket_s": B, "codes": table,
-                       "sealed": {str(b): None if v is None else packed(v)
-                                  for b, v in sorted(keep.items())}}
-    return {"generated_unix": now, "bucket_s": B, "from_unix": frm, "machines": machines}
+        machines[c] = _bits_b64(HEALTH_MINUTES, index(voted.get(c, set()) | hit.get(c, set()), frm, HEALTH_MINUTES))
+    known = _bits_b64(HEALTH_MINUTES, [i for i in range(HEALTH_MINUTES) if frm + i * M not in all_unknown])
+    # Keep what is now final enough: [frm, new_upto).
+    final = (chain.get("finalized") or {}).get("time")
+    new_upto = upto_ok
+    if _req_int(final):
+        lim = min(final // 1000 - HEALTH_SEAL_S, now - HEALTH_SEAL_S) // M * M
+        new_upto = max(upto_ok, min(lim, end))
+    n = (new_upto - frm) // M
+    kept_codes = {}
+    for c in set(voted) | set(hit):
+        ts = index(voted.get(c, set()) | hit.get(c, set()), frm, n)
+        if ts:
+            kept_codes[c] = _bits_b64(n, ts)
+    state["health"] = {"start_time": start, "minute_s": M, "base": frm, "upto": new_upto,
+                       "unknown": _bits_b64(n, index(all_unknown, frm, n)), "codes": kept_codes}
+    return {"generated_unix": now, "minute_s": M, "from_unix": frm, "minutes": HEALTH_MINUTES,
+            "known": known, "machines": machines}
 
 
 # ---- awards.json "balances" (per-account chain balances, validator rc.19) ----------
@@ -2294,7 +2334,7 @@ def main():
         print("awards.json not written: %s" % type(e).__name__, file=sys.stderr)
     if awards:
         write_json(os.path.join(out, "awards.json"), awards)
-    # Votes per machine per 5 minutes (see build_health). Optional, like blocks.json.
+    # The minutes each machine voted in, last 24 h (see build_health). Optional, like blocks.json.
     health = None
     try:
         health = build_health(a.api, chain, [m.get("code") for x in vals["accounts"]

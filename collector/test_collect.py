@@ -843,6 +843,14 @@ def hchain(start, head_slot, final_slot):
             "finalized": {"slot": final_slot, "time": start + final_slot * 30000}}
 
 
+def bits(s, n=1440):
+    """A health.json bitmap as a list of 0/1 (bit i = byte i // 8, MSB first)."""
+    import base64
+    b = base64.b64decode(s)
+    assert len(b) == (n + 7) // 8
+    return [(b[i >> 3] >> (7 - (i & 7))) & 1 for i in range(n)]
+
+
 class Health(unittest.TestCase):
     def setUp(self):
         self.real_get = collect.get
@@ -853,94 +861,99 @@ class Health(unittest.TestCase):
     def slot_at(self, unix, start=HSTART):
         return (unix * 1000 - start) // 30000
 
-    def test_counts_by_voted_slot_nulls_and_shape(self):
-        # A chain that started 2 hours before NOW: everything before is unknown (null).
-        start = (NOW - 7200) // 300 * 300 * 1000
+    def test_bitmap_encoding(self):
+        s = collect._bits_b64(16, [0, 9, 15])
+        import base64
+        self.assertEqual(base64.b64decode(s), bytes([0x80, 0x41]))   # MSB first
+        self.assertEqual(collect._b64_bits(s, 16), {0, 9, 15})
+        self.assertIsNone(collect._b64_bits(s, 24))                   # wrong length
+        self.assertIsNone(collect._b64_bits("@@@", 16))
+
+    def test_minutes_by_voted_slot_known_and_shape(self):
+        # A chain that started 2 hours before NOW: everything before is unknown.
+        start = (NOW - 7200) // 60 * 60 * 1000
         head = self.slot_at(NOW - 20, start)
         rows = []
         for s in range(1, head + 1):
             votes = [("0000000a", s - 1)]                      # a votes for every slot
-            if s % 2 == 0:
-                votes.append(("0000000b", s - 2))              # b for every other slot
+            if s % 8 == 0:
+                votes.append(("0000000b", s - 3))              # b every 4 minutes
             rows.append(hrow(start, s, votes))
-        rows[5]["votes"].append(dict(rows[4]["votes"][0]))     # a vote seen twice counts once
         collect.get = BlocksNode(start, 30000, rows, first_day=start // 86400000)
-        st = {}
         h = collect.build_health("x", hchain(start, head, head - 20),
-                                 ["0000000a", "0000000b", "0000000c", "BAD"], st, NOW)
-        self.assertEqual(set(h), {"generated_unix", "bucket_s", "from_unix", "machines"})
-        self.assertEqual(h["bucket_s"], 300)
-        self.assertEqual(h["from_unix"] % 300, 0)
-        self.assertEqual(h["from_unix"], NOW // 300 * 300 - 86400)
+                                 ["0000000a", "0000000b", "0000000c", "BAD"], {}, NOW)
+        self.assertEqual(set(h), {"generated_unix", "minute_s", "from_unix", "minutes", "known", "machines"})
+        self.assertEqual((h["minute_s"], h["minutes"]), (60, 1440))
+        self.assertEqual(h["from_unix"], NOW // 60 * 60 - 86400)
         self.assertEqual(sorted(h["machines"]), ["0000000a", "0000000b", "0000000c"])
-        a, b, c = (h["machines"][k] for k in ("0000000a", "0000000b", "0000000c"))
-        self.assertEqual(len(a), 288)
-        first = (start // 1000 - h["from_unix"]) // 300         # the chain's first bucket
-        self.assertTrue(all(x is None for x in a[:first]))      # before the chain: unknown
-        self.assertEqual(a[first:first + 22], [10] * 22)        # 10 slots per 5 minutes
-        self.assertEqual(b[first:first + 22], [5] * 22)
-        self.assertEqual(c[first:first + 22], [0] * 22)         # known and silent: 0, not null
-        self.assertEqual(a[-1], 10)
+        known = bits(h["known"])
+        a, b, c = (bits(h["machines"][k]) for k in ("0000000a", "0000000b", "0000000c"))
+        first = (start // 1000 - h["from_unix"]) // 60          # the chain's first minute
+        self.assertEqual(known, [0] * first + [1] * (1440 - first))
+        self.assertEqual(a, [0] * first + [1] * (1440 - first))  # every minute
+        self.assertEqual(sum(b[first:]), len(range(5, head - 2, 8)))
+        self.assertEqual(sum(c), 0)                             # silent: known, no bit
 
     def test_after_the_head_is_unknown(self):
-        head = self.slot_at(NOW - 1000)                        # the node lags ~17 minutes
+        head = self.slot_at(NOW - 200)                         # the node lags ~3 minutes
         rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
         collect.get = BlocksNode(HSTART, 30000, rows)
         h = collect.build_health("x", hchain(HSTART, head, head - 20), ["0000000a"], {}, NOW)
-        a = h["machines"]["0000000a"]
-        self.assertEqual(a[-3:], [None, None, None])           # the head is inside the first
-        self.assertEqual(a[-4], 10)                            # ... of these: unknown too
+        known, a = bits(h["known"]), bits(h["machines"]["0000000a"])
+        self.assertEqual(known[-4:], [1, 0, 0, 0])             # the head is in the 3rd last
+        self.assertEqual(a[-4:], [1, 0, 0, 0])
 
-    def test_kept_buckets_make_the_next_run_small_and_identical(self):
+    def test_kept_minutes_make_the_next_run_small_and_identical(self):
         head = self.slot_at(NOW - 15)
-        rows = [hrow(HSTART, s, [("0000000a", s - 1), ("0000000b", s - 3)]) for s in range(head - 3000, head + 1)]
+        rows = [hrow(HSTART, s, [("0000000a", s - 1)] + ([("0000000b", s - 3)] if s % 5 == 0 else []))
+                for s in range(head - 3000, head + 1)]
         node = BlocksNode(HSTART, 30000, rows)
         collect.get = node
         st = {}
         ch = hchain(HSTART, head, head - 20)
-        h1 = collect.build_health("x", ch, ["0000000a", "0000000b"], st, NOW)
-        first_run = len(node.asked)
-        self.assertGreater(first_run, 10)                       # 24 h: many pages
-        self.assertIn("health", st)
-        self.assertLessEqual(len(json.dumps(st)), 20000)
+        codes = ["0000000a", "0000000b"]
+        h1 = collect.build_health("x", ch, codes, st, NOW)
+        self.assertGreater(len(node.asked), 10)                 # 24 h: many pages
+        self.assertLessEqual(len(json.dumps(st)), 2000)
         node.asked.clear()
-        h2 = collect.build_health("x", ch, ["0000000a", "0000000b"], st, NOW + 5)
-        self.assertEqual(h1["machines"], h2["machines"])
+        h2 = collect.build_health("x", ch, codes, st, NOW + 5)
+        self.assertEqual((h1["machines"], h1["known"]), (h2["machines"], h2["known"]))
         self.assertLessEqual(len(node.asked), 2)                 # only the last ~45 minutes
-        # a kept bucket is never recounted: a late change to an old block is not seen
+        # a minute later the window moves by one: still the same bits, shifted
+        h4 = collect.build_health("x", ch, codes, json.loads(json.dumps(st)), NOW + 60)
+        self.assertEqual(bits(h4["machines"]["0000000b"])[:-1], bits(h1["machines"]["0000000b"])[1:])
+        # another chain start, or a damaged state: everything is read again
+        for broken in ({"start_time": HSTART + 1}, {"unknown": "x"}, {"codes": {"0000000a": "AAAA"}}):
+            node.asked.clear()
+            st3 = json.loads(json.dumps(st))
+            st3["health"].update(broken)
+            h5 = collect.build_health("x", ch, codes, st3, NOW + 5)
+            self.assertGreater(len(node.asked), 10, broken)
+            self.assertEqual(h5["machines"], h2["machines"])
+        # a kept minute is never recounted: a late change to an old block is not seen
         st2 = json.loads(json.dumps(st))
         for r in rows[:500]:
             r["votes"] = []
-        h3 = collect.build_health("x", ch, ["0000000a", "0000000b"], st2, NOW + 5)
+        h3 = collect.build_health("x", ch, codes, st2, NOW + 5)
         self.assertEqual(h1["machines"], h3["machines"])
-        # another chain start: the kept counts are dropped and everything is read again
-        node.asked.clear()
-        st3 = json.loads(json.dumps(st))
-        st3["health"]["start_time"] = HSTART + 1
-        collect.build_health("x", ch, ["0000000a", "0000000b"], st3, NOW + 5)
-        self.assertGreater(len(node.asked), 10)
 
     def test_fail_closed(self):
         head = self.slot_at(NOW - 15)
         day = (HSTART + head * 30000) // 86400000
         rows = [hrow(HSTART, s, [("0000000a", s - 1)]) for s in range(head - 3000, head + 1)]
         ch = hchain(HSTART, head, head - 20)
-        # a day in the window this node recorded only in part: nothing (not nulls)
+        # a day in the window this node recorded only in part: nothing (not unknown bits)
         collect.get = BlocksNode(HSTART, 30000, rows, recorded={day - 1: "part"})
         st = {"health": "untouched"}
         self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
-        self.assertEqual(st, {"health": "untouched"})
-        # a vote of an unexpected form
         bad = json.loads(json.dumps(rows))
         bad[-1]["votes"][0]["key_code"] = "nothex!!"
         collect.get = BlocksNode(HSTART, 30000, bad)
         self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
-        # a vote for the block's own slot or later is not a vote this route returns
         bad = json.loads(json.dumps(rows))
-        bad[-1]["votes"][0]["slot"] = bad[-1]["slot"]
+        bad[-1]["votes"][0]["slot"] = bad[-1]["slot"]          # not a vote for an earlier slot
         collect.get = BlocksNode(HSTART, 30000, bad)
         self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
-        # too many pages
         collect.get = BlocksNode(HSTART, 30000, rows)
         real = collect.HEALTH_PAGES
         collect.HEALTH_PAGES = 3
@@ -948,7 +961,6 @@ class Health(unittest.TestCase):
             self.assertIsNone(collect.build_health("x", ch, ["0000000a"], st, NOW))
         finally:
             collect.HEALTH_PAGES = real
-        # no roster, no chain figures
         self.assertIsNone(collect.build_health("x", ch, [], st, NOW))
         self.assertIsNone(collect.build_health("x", {"slot_ms": 30000}, ["0000000a"], st, NOW))
         self.assertEqual(st, {"health": "untouched"})
