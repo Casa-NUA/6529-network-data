@@ -30,10 +30,10 @@ minutes of the last 24 h in which it voted, from the same blocks route), and
 adds each account's public 6529 handle (from api.6529.io) to validators.json. From
 18 Nov 2026 it also republishes 6529's signed release feed as releases.json once its
 signature verifies, and adds network.json `crosscheck` ("6529 agrees", against
-api.6529.io's TDH history and the feed's signed checkpoints), and from 28 Nov 2026
-network.json `chain_roster` (five counts of the chain's award roster, from the node's own
-chain/roster route). Those three are the only
-requests that leave this machine, all public GETs (see their sections). It keeps a small state file NEXT TO the data
+api.6529.io's TDH history and the feed's signed checkpoints). Those three are the only
+requests that leave this machine, all public GETs (see their sections). From 28 Nov 2026
+network.json also has `chain_roster` (five counts of the chain's award roster), read from
+the local node's own chain/roster route, which never leaves the machine. It keeps a small state file NEXT TO the data
 directory (never inside it): the handle cache, the day's last validator list and the
 award days that are settled, and the last balances read.
 
