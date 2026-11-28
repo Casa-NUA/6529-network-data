@@ -419,7 +419,7 @@ class SignNames(unittest.TestCase):
         root = tempfile.mkdtemp()
         try:
             for n in ("network.json", "history.json", "awards.json", "releases.json", "releases.json.sig",
-                      "health.json", "health.json.tmp",
+                      "health.json", "health.json.tmp", "blockdays.json", "blockdays.json.tmp",
                       "own.json", "days/index.json",
                       "days/20771.json", "days/x.json", "days/20771.json.tmp", "cycles/20771.json",
                       "other/1.json"):
@@ -428,7 +428,7 @@ class SignNames(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("{}")
             self.assertEqual(sign.data_files(root), [
-                "awards.json", "health.json", "history.json", "network.json", "releases.json",
+                "awards.json", "blockdays.json", "health.json", "history.json", "network.json", "releases.json",
                 "cycles/20771.json",
                 "days/20771.json", "days/index.json"])
             shutil.rmtree(os.path.join(root, "days"))
@@ -671,6 +671,198 @@ class Notable(unittest.TestCase):
             b = self.run_blocks(10001, maker, finalized=fin)
             self.assertIsNotNone(b, fin)                      # the rest of blocks.json is kept
             self.assertNotIn("notable", b, fin)               # fail-closed: absent, not guessed
+
+
+def chain_store(root, last, maker, slot_ms=30000, days_back=4, first=1):
+    """A chain store holding blocks first..last (one per slot), as read_block_index expects.
+    (start, head, own figures per day {day: own blocks})."""
+    import struct
+    start = (NOW // 86400 - days_back) * 86400000
+    d = os.path.join(root, "chain", "net", "index")
+    os.makedirs(d)
+    parent, own = b"\0" * 32, {}
+    with open(os.path.join(d, "blocks.log"), "wb") as f:
+        for h in range(1, last + 1):
+            t = start + h * slot_ms
+            r = struct.pack(">Q", h).rjust(32, b"\1")
+            if maker(h) == R[0]:
+                own[t // 86400000] = own.get(t // 86400000, 0) + 1
+            if h >= first:
+                body = (b"\x01\x01" + r + parent + struct.pack(">QQIQ", h, h, t // 86400000, t)
+                        + b"\x09" * 32 + b"\0" * 12 + bytes.fromhex(maker(h)[2:]) + b"extra")
+                f.write(struct.pack(">I", len(body)) + body + b"\0" * 8)
+            parent = r
+    head = {"root": "0x" + parent.hex(), "height": last, "slot": last, "time": t}
+    return start, head, own
+
+
+class BlockDays(unittest.TestCase):
+    """chain_blockdays: blockdays.json, every whole past chain day."""
+
+    def setUp(self):
+        collect._dropped.clear()
+        self.real_get, self.real_dirs = collect.get, collect.STORE_DIRS
+        self.root = tempfile.mkdtemp()
+        collect.STORE_DIRS = (self.root,)
+
+    def tearDown(self):
+        collect.get, collect.STORE_DIRS = self.real_get, self.real_dirs
+        shutil.rmtree(self.root)
+
+    def node(self, last, maker, slot_ms=30000, days_back=4, first=1, finalized=None, own_fix=None):
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        start, head, own = chain_store(self.root, last, maker, slot_ms, days_back, first)
+        today = head["time"] // 86400000
+        chain = {"head": head, "start_time": start, "slot_ms": slot_ms,
+                 "finalized": {"height": last - 2 if finalized is None else finalized}}
+        past = dict((d, n) for d, n in own.items() if d != today)
+        past.update(own_fix or {})
+        collect.get = FakeNode({
+            "chain": chain, "chain/me": {"wallet": R[0]},
+            "awards/days": {"days": [{"day": d, "blocks": n} for d, n in sorted(past.items())]},
+            "awards": {"today": {"day": today, "blocks": own.get(today, 0)},
+                       "as_of": {"height": last}}})
+        self.now = head["time"] // 1000 + 10
+        return today, start
+
+    def build(self, state=None, have_file=False, now=None, hint=None):
+        st = {} if state is None else state
+        return collect.chain_blockdays("x", R, self.now if now is None else now, st, have_file,
+                                       day_hint=hint) + (st,)
+
+    def test_short_chain(self):
+        maker = lambda h: OUTSIDER if h % 100 == 0 else R[h % 10]
+        today, start = self.node(10100, maker)
+        b, why, st = self.build()
+        self.assertIsNone(why)
+        d0 = start // 86400000
+        self.assertEqual(b["day"], today)
+        self.assertEqual(b["days"], [d0, d0 + 1, d0 + 2])             # today left out
+        self.assertEqual(today, d0 + 3)
+        self.assertEqual(b["first_day"], d0)
+        self.assertEqual(b["totals"], [2879, 2880, 2880])               # heights 1..2879 on day 0
+        self.assertNotIn("generated_unix", b)
+        self.assertEqual(set(b), {"day", "first_day", "days", "totals", "accounts"})
+        self.assertNotIn(OUTSIDER, json.dumps(b))                       # counted, never listed
+        self.assertEqual([x["wallet"] for x in b["accounts"]], sorted(R))
+        by = dict((x["wallet"], x["counts"]) for x in b["accounts"])
+        for i, d in enumerate(b["days"]):
+            hs = [h for h in range(1, 10101) if (start + h * 30000) // 86400000 == d]
+            self.assertEqual(by[R[3]][i], sum(1 for h in hs if maker(h) == R[3]))
+        self.assertEqual(sum(sum(c) for c in by.values()) + sum(1 for h in range(1, 8640) if h % 100 == 0),
+                         sum(b["totals"]))
+        self.assertEqual(st["blockdays"], {"day": today, "final": True, "unix": self.now})
+
+    def test_zero_accounts_left_out(self):
+        maker = lambda h: R[0] if h < 2880 * 2 else R[1 + h % 9]   # R[1..9] only from day 2 on
+        self.node(10100, maker)
+        b, why, _ = self.build()
+        self.assertIsNone(why)
+        self.assertEqual([x["wallet"] for x in b["accounts"]], sorted(R))
+        self.node(3000, lambda h: R[h % 2])                            # only R[0], R[1] made blocks
+        b, why, _ = self.build()
+        self.assertEqual([x["wallet"] for x in b["accounts"]], [R[0], R[1]])
+
+    def test_first_day_cut(self):
+        today, start = self.node(10100, lambda h: R[h % 10], first=100)   # the store lacks 1..99
+        b, why, _ = self.build()
+        self.assertIsNone(why)
+        self.assertEqual(b["days"], [start // 86400000 + 1, start // 86400000 + 2])
+        self.assertEqual(b["first_day"], start // 86400000 + 1)
+
+    def test_no_whole_past_day(self):
+        self.node(1000, lambda h: R[h % 10], days_back=0)              # the chain started today
+        b, why, st = self.build()
+        self.assertIsNone(b)
+        self.assertIn("no whole past chain day", why)
+        self.assertNotIn("blockdays", st)
+
+    def test_400_cap(self):
+        slot = 6 * 3600 * 1000                                        # 4 blocks a day
+        today, start = self.node(425 * 4 + 1, lambda h: R[h % 10], slot_ms=slot, days_back=425)
+        b, why, _ = self.build()
+        self.assertIsNone(why)
+        self.assertEqual(len(b["days"]), 400)
+        self.assertEqual(b["days"][-1], today - 1)                     # the newest kept
+        self.assertEqual(b["days"], list(range(today - 400, today)))
+        self.assertEqual(b["first_day"], today - 400)
+        self.assertTrue(all(t == 4 for t in b["totals"]))
+        self.assertTrue(all(len(x["counts"]) == 400 for x in b["accounts"]))
+
+    def test_self_check_failure(self):
+        d1 = NOW // 86400 - 4 + 1
+        today, start = self.node(10100, lambda h: R[h % 10], own_fix={d1: 7})
+        b, why, st = self.build()
+        self.assertIsNone(b)
+        self.assertIn("SELF-CHECK FAILED for day %d" % d1, why)
+        self.assertNotIn("blockdays", st)                               # retried next run
+
+    def test_self_check_today(self):
+        self.node(10100, lambda h: R[h % 10])
+        routes = collect.get.routes
+        routes["awards"]["today"]["blocks"] += 1
+        b, why, st = self.build()
+        self.assertIsNone(b)
+        self.assertIn("SELF-CHECK FAILED for today", why)
+
+    def test_too_many_outsiders_recently(self):
+        self.node(10100, lambda h: R[0] if h % 2 else "0x%040x" % (1000 + h % 50))
+        b, why, _ = self.build()
+        self.assertIsNone(b)
+        self.assertIn("not validating accounts", why)
+
+    def test_same_text_same_day(self):
+        self.node(10100, lambda h: R[h % 10])
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out)
+        p = os.path.join(out, "blockdays.json")
+        b, why, st = self.build()
+        collect.write_json(p, b)
+        with open(p, "rb") as f:
+            first = f.read()
+        # Built again later the same day (a fresh state): byte for byte the same text.
+        b2, why, _ = self.build(now=self.now + 50)
+        collect.write_json(p, b2)
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), first)
+        # Not due again that day while yesterday is final: nothing asked, file left as it is.
+        collect.get.asked[:] = []
+        b3, why, st2 = self.build(state=st, have_file=True, now=self.now + 7200, hint=b["day"])
+        self.assertEqual((b3, why), (None, None))
+        self.assertEqual(collect.get.asked, [])
+        b3, why, _ = self.build(state=st, have_file=True, now=self.now + 7200)
+        self.assertEqual((b3, why), (None, None))                       # same, without a hint
+
+    def test_due(self):
+        due = collect.blockdays_due
+        self.assertTrue(due({}, 5, NOW, True))                          # never built
+        self.assertTrue(due({"blockdays": {"day": 5, "final": True, "unix": NOW}}, 5, NOW, False))  # file gone
+        self.assertTrue(due({"blockdays": {"day": 4, "final": True, "unix": NOW}}, 5, NOW, True))   # new day
+        self.assertFalse(due({"blockdays": {"day": 5, "final": True, "unix": NOW - 99999}}, 5, NOW, True))
+        nf = {"blockdays": {"day": 5, "final": False, "unix": NOW - 3599}}
+        self.assertFalse(due(nf, 5, NOW, True))                         # not final: hourly
+        self.assertTrue(due(nf, 5, NOW + 1, True))
+        self.assertTrue(due({"blockdays": {"day": 5, "final": False, "unix": NOW + 60}}, 5, NOW, True))
+        self.assertTrue(due({"blockdays": "junk"}, 5, NOW, True))
+
+    def test_yesterday_not_final(self):
+        today, start = self.node(10100, lambda h: R[h % 10], finalized=8000)   # below 8639 (day 2's last)
+        b, why, st = self.build()
+        self.assertIsNotNone(b)
+        self.assertFalse(st["blockdays"]["final"])
+        self.assertTrue(collect.blockdays_due(st, today, self.now + 3600, True))
+        self.node(10100, lambda h: R[h % 10], finalized=8639)                  # exactly the last block
+        b, why, st = self.build()
+        self.assertTrue(st["blockdays"]["final"])
+
+    def test_blocks_json_unchanged(self):
+        # The refactor that shares the reading with blocks.json keeps blocks.json as it was.
+        today, start = self.node(10100, lambda h: R[h % 10])
+        b = collect.chain_blocks("x", R, self.now)
+        self.assertEqual(b["days"], [start // 86400000 + i for i in range(4)])
+        self.assertIn("generated_unix", b)
+        self.assertEqual(b["head_height"], 10100)
 
 
 class Signing(unittest.TestCase):

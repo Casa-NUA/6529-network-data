@@ -18,7 +18,7 @@ export const PINNED = Object.freeze([
 // The names published under docs/data/signed/ (sign.py). cycles/index.json is published too,
 // so it is allowed beside the spec's list (an unlisted name would refuse the whole batch).
 const NAMES = [
-  /^(network|validators|blocks|chain|awards|history|releases|health)\.json$/,
+  /^(network|validators|blocks|blockdays|chain|awards|history|releases|health)\.json$/,
   /^cycles\/(index|\d{5})\.json$/,
   /^days\/(index|\d{5})\.json$/,
 ];

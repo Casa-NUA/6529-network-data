@@ -574,11 +574,11 @@ def read_block_index(path, from_day):
     return recs or None
 
 
-def chain_blocks(api, roster_wallets, now):
-    """Blocks each account made over the last days, or None (and why on stderr)."""
-    def no(why):
-        print("blocks.json not written: %s" % why, file=sys.stderr)
-        return None
+def _chain_figures(api, now, no):
+    """The node's head and its own figures at the same block height, or None (via `no`).
+
+    (root, height, hslot, htime, final_height, start, slot_ms, own, today_own, own_days, day)
+    """
     # The head and the node's own figures must describe the same block height. A block
     # can land between the two requests, so ask again a few times; if they still
     # differ, skip this run, whoever made that block.
@@ -612,14 +612,19 @@ def chain_blocks(api, roster_wallets, now):
         return no("the node's own figures are for another day (a new day is starting)")
     if not (now - 3 * 86400) * 1000 < htime <= (now + 600) * 1000:
         return no("the head block's time is out of range")
+    return (root, height, hslot, htime, final_height, start, slot_ms, own, today_own, own_days, day)
 
+
+def _canon_chain(root, from_day, hslot, height, day, htime, start, slot_ms, no):
+    """The store's blocks from the head back to `from_day`, newest first, checked against
+    public facts; or None (via `no`)."""
     paths = []
     for d in STORE_DIRS:
         paths += glob.glob(os.path.join(os.path.expanduser(d), "chain", "*", "index", "blocks.log"))
     paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
     canon, cur = None, bytes.fromhex(root[2:])
     for p in paths[:4]:
-        recs = read_block_index(p, day - BLOCK_DAYS)
+        recs = read_block_index(p, from_day)
         if not recs or cur not in recs:
             continue
         canon, c = [], cur
@@ -636,6 +641,21 @@ def chain_blocks(api, roster_wallets, now):
     for i, c in enumerate(canon):
         if c[4] != start + c[1] * slot_ms or (i and (canon[i - 1][2] != c[2] + 1 or canon[i - 1][1] <= c[1])):
             return no("the store's blocks do not follow one another as a chain does")
+    return canon
+
+
+def chain_blocks(api, roster_wallets, now):
+    """Blocks each account made over the last days, or None (and why on stderr)."""
+    def no(why):
+        print("blocks.json not written: %s" % why, file=sys.stderr)
+        return None
+    fig = _chain_figures(api, now, no)
+    if fig is None:
+        return None
+    root, height, hslot, htime, final_height, start, slot_ms, own, today_own, own_days, day = fig
+    canon = _canon_chain(root, day - BLOCK_DAYS, hslot, height, day, htime, start, slot_ms, no)
+    if canon is None:
+        return None
 
     def count(d):
         out = {}
@@ -697,6 +717,99 @@ def chain_blocks(api, roster_wallets, now):
     if notable is not None:
         out["notable"] = notable
     return out
+
+
+# ---- Blocks per account per past day (blockdays.json) ------------------------------
+# The same reading as blocks.json (the node's chain store, the same two checks), over every
+# WHOLE past chain day instead of the last week: from the chain's first whole day (the day of
+# block height 1, or the day after the oldest block the store holds when it does not reach
+# height 1) to yesterday, at most BLOCKDAYS_MOST days (the newest). Today is left out:
+# blocks.json has it. No generated_unix, so the text stays byte for byte the same within a
+# day (sign.py then keeps its envelope and nothing new is committed): it changes once a day,
+# plus a late reorganisation of yesterday while yesterday was not yet final.
+#
+# Walking the whole index is done only when needed (the file is missing, the chain day
+# changed since the last build, or at most once an hour while yesterday was not final at the
+# last build); otherwise the file is left as it is. Any failure leaves the old file as it is.
+BLOCKDAYS_MOST = 400
+BLOCKDAYS_RETRY_S = 3600
+
+
+def blockdays_due(state, day, now, have_file):
+    """Whether blockdays.json should be built this run (see above)."""
+    st = state.get("blockdays")
+    if not have_file or not isinstance(st, dict) or st.get("day") != day:
+        return True
+    if st.get("final") is True:
+        return False
+    built = st.get("unix")
+    return not (isinstance(built, int) and 0 <= now - built < BLOCKDAYS_RETRY_S)
+
+
+def _head_day(chain):
+    t = ((chain or {}).get("head") or {}).get("time")
+    return t // 86400000 if _req_int(t) else None
+
+
+def chain_blockdays(api, roster_wallets, now, state, have_file, day_hint=None):
+    """(payload or None, why skipped or None). `state["blockdays"]` is updated when built.
+
+    `day_hint`: the chain day of the head already read this run, if known; when the file is
+    not due for that day the node is not even asked (no request, no walk)."""
+    if isinstance(day_hint, int) and not blockdays_due(state, day_hint, now, have_file):
+        return None, None
+    reasons = []
+
+    def no(why):
+        reasons.append(why)
+        return None
+    fig = _chain_figures(api, now, no)
+    if fig is None:
+        return None, reasons[0]
+    root, height, hslot, htime, final_height, start, slot_ms, own, today_own, own_days, day = fig
+    if not blockdays_due(state, day, now, have_file):
+        return None, None                       # nothing to do: the file stays as it is
+    canon = _canon_chain(root, day - BLOCKDAYS_MOST - 1, hslot, height, day, htime,
+                         start, slot_ms, no)
+    if canon is None:
+        return None, reasons[0]
+    first_whole = canon[-1][3] if canon[-1][2] == 1 else canon[-1][3] + 1
+    days = list(range(max(first_whole, day - BLOCKDAYS_MOST), day))
+    if not days:
+        return None, "no whole past chain day yet"
+    per_day = {d: {} for d in days + [day]}
+    for c in canon:
+        if c[3] in per_day:
+            per_day[c[3]][c[5]] = per_day[c[3]].get(c[5], 0) + 1
+    # Self-check, at the same height on both sides (see chain_blocks): today, then every past
+    # day the node has a figure for.
+    if day >= first_whole and per_day[day].get(own, 0) != today_own.get("blocks"):
+        return None, "SELF-CHECK FAILED for today: the store's format may have changed"
+    for d in days:
+        if d in own_days and per_day[d].get(own, 0) != own_days[d]:
+            return None, "SELF-CHECK FAILED for day %d: the store's format may have changed" % d
+    makers = sorted(set().union(*[set(per_day[d]) for d in days]))
+    known = set(roster_wallets)
+    listed = [w for w in makers if w in known and clean(w, WALLET) is not _BAD]
+    # The misread guard of blocks.json, over the last week only: over a long history many
+    # makers have left the roster, and they are counted in the totals, not listed.
+    recent = set().union(*[set(per_day[d]) for d in days[-BLOCK_DAYS:]])
+    if len([w for w in recent if w in known]) * 10 < len(recent) * 9:
+        return None, "too many recent block makers are not validating accounts"
+    out = {
+        "day": day, "first_day": days[0], "days": days,
+        "totals": [sum(per_day[d].values()) for d in days],
+        "accounts": [{"wallet": w, "counts": [per_day[d].get(w, 0) for d in days]}
+                     for w in listed],
+    }
+    out["accounts"] = [x for x in out["accounts"] if any(x["counts"])]
+    # Yesterday is final once the chain's finalized height reaches its last block: the
+    # block just before today's first one (or the head's parent line, if today has none).
+    today_heights = [c[2] for c in canon if c[3] == day]
+    last_of_yesterday = (min(today_heights) if today_heights else height + 1) - 1
+    final = _req_int(final_height) and last_of_yesterday <= final_height <= height
+    state["blockdays"] = {"day": day, "final": bool(final), "unix": now}
+    return out, None
 
 
 # ---- The collector's own state (never published) -----------------------------------
@@ -2376,6 +2489,21 @@ def main():
         blocks = None
     if blocks:
         write_json(os.path.join(out, "blocks.json"), blocks)
+
+    # Blocks per account per whole past chain day (see chain_blockdays). Optional, like
+    # blocks.json: built only when due, and any failure leaves the old file as it is.
+    try:
+        bd_path = os.path.join(out, "blockdays.json")
+        blockdays, why = chain_blockdays(a.api, [x["wallet"].lower() for x in vals["accounts"]],
+                                         int(time.time()), state, os.path.isfile(bd_path),
+                                         day_hint=_head_day(chain)) \
+            if (chain and vals) else (None, None)
+        if why:
+            print("blockdays.json not written: %s" % why, file=sys.stderr)
+        if blockdays:
+            write_json(bd_path, blockdays)
+    except Exception as e:             # never let this optional file stop the others
+        print("blockdays.json not written: %s" % type(e).__name__, file=sys.stderr)
 
     # Past days, history and awards. Optional: each is wrapped so that a failure only
     # leaves that file as it was (its generated_unix then shows its age).

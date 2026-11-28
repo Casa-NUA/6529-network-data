@@ -81,11 +81,11 @@ await assert.rejects(verifyEnvelope(otherNet, "network.json", PINS), /unknown ke
 await assert.rejects(verifyEnvelope(await signed("network.json", { generated_unix: NOW }), "network.json"), /unknown key/);
 ok.push("unpinned keys are refused by the verifier");
 for (const n of ["network.json", "validators.json", "blocks.json", "chain.json", "awards.json", "history.json",
-  "releases.json", "health.json", "cycles/20775.json", "cycles/index.json", "days/index.json", "days/20774.json"]) assert.ok(allowed(n), n);
-for (const n of ["live.json", "own.json", "releases.json.sig", "Health.json", "health.json.tmp", "signed/health.json", "Releases.json", "releases.json/", "signed/releases.json", "signed/network.json", "../network.json", "/network.json", "network.json/",
+  "releases.json", "health.json", "blockdays.json", "cycles/20775.json", "cycles/index.json", "days/index.json", "days/20774.json"]) assert.ok(allowed(n), n);
+for (const n of ["live.json", "own.json", "blockday.json", "Blockdays.json", "blockdays.json.tmp", "releases.json.sig", "Health.json", "health.json.tmp", "signed/health.json", "Releases.json", "releases.json/", "signed/releases.json", "signed/network.json", "../network.json", "/network.json", "network.json/",
   "days/1.json", "days/207740.json", "days/x.json", "cycles/2077.json", "days/20774.json.tmp", "Network.json",
   "days/index2.json", "days\\20774.json", "network.json\n", "", "cycles/20775.JSON"]) assert.ok(!allowed(n), JSON.stringify(n));
-ok.push("name allow-list: the 12 published kinds yes (releases.json and health.json included), look-alikes no");
+ok.push("name allow-list: the 13 published kinds yes (releases.json, health.json and blockdays.json included), look-alikes no");
 
 // ---- 2. the real files, through the production handler ----------------------------------
 await check("GET before the first publish = 404", await GET("network.json"), 404);
