@@ -30,7 +30,9 @@ minutes of the last 24 h in which it voted, from the same blocks route), and
 adds each account's public 6529 handle (from api.6529.io) to validators.json. From
 18 Nov 2026 it also republishes 6529's signed release feed as releases.json once its
 signature verifies, and adds network.json `crosscheck` ("6529 agrees", against
-api.6529.io's TDH history and the feed's signed checkpoints). Those three are the only
+api.6529.io's TDH history and the feed's signed checkpoints), and from 28 Nov 2026
+network.json `chain_roster` (five counts of the chain's award roster, from the node's own
+chain/roster route). Those three are the only
 requests that leave this machine, all public GETs (see their sections). It keeps a small state file NEXT TO the data
 directory (never inside it): the handle cache, the day's last validator list and the
 award days that are settled, and the last balances read.
@@ -433,6 +435,40 @@ NETWORK = {
     "first_day": INT, "latest_certified_day": INT, "latest_final_day": INT,
     "next_keys": INT, "next_accounts": INT,
 }
+
+
+# network.json `chain_roster` (from 28 Nov 2026): the node's chain/roster, the list the 6529
+# chain uses for awards (fixed at 22:00 UTC for the next day), as five counts:
+#   {"day": int, "accounts": int, "keys": int, "active_keys": int, "active_accounts": int}
+# keys = the route's `validators`, active_keys = its `active`. Only those five numbers are read
+# (the route's per-key list, weight and times are not published). Optional and all or nothing:
+# an older node without the route, an error, or any of the five missing or not a whole number
+# >= 0 (or a day out of range) leaves `chain_roster` out of network.json; nothing else changes.
+ROSTER_TIMEOUT_S = 10
+ROSTER_FIELDS = (("day", "day"), ("accounts", "accounts"), ("keys", "validators"),
+                 ("active_keys", "active"), ("active_accounts", "active_accounts"))
+
+
+def parse_roster(r):
+    if not isinstance(r, dict):
+        return None
+    out = {}
+    for mine, theirs in ROSTER_FIELDS:
+        v = INT(r.get(theirs))
+        if v is _BAD:
+            return None
+        out[mine] = v
+    if not 19000 < out["day"] < 40000:
+        return None
+    return out
+
+
+def chain_roster(api, fetch=None):
+    try:
+        r = (fetch or get)(api, "chain/roster", timeout=ROSTER_TIMEOUT_S)
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        return None
+    return parse_roster(r)
 
 
 def summary(c):
@@ -2311,6 +2347,14 @@ def main():
     net["crosscheck"] = cc if (cc is not _BAD and cc and cc.get("day") == today) else None
     # The iOS app's App Store version as last known (refreshed at the end of the run too).
     net["app"] = app_known(state, previous.get("app"))
+    # The chain's award roster (see chain_roster). Optional: left out when not read.
+    try:
+        roster = chain_roster(a.api)
+    except Exception as e:             # never let this optional field stop the run
+        print("chain_roster not read: %s" % type(e).__name__, file=sys.stderr)
+        roster = None
+    if roster:
+        net["chain_roster"] = roster
     write_json(os.path.join(out, "network.json"), net)
 
     # The 6529 chain (rc.16+). Optional: older nodes have no /chain.

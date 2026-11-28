@@ -1625,5 +1625,58 @@ class AppVersion(unittest.TestCase):
         self.assertEqual(seen[1], collect.APP_TIMEOUT_S)
 
 
+class ChainRoster(unittest.TestCase):
+    """network.json `chain_roster` from the node's chain/roster (28 Nov 2026)."""
+    # As the node answered on 28 Nov 2026 (the per-key list shortened).
+    REAL = {"day": 20785, "date": "2026-11-28", "state": "live", "held": True, "accounts": 290,
+            "validators": 310, "w": "641952070", "active": 295, "active_accounts": 275,
+            "keys": [{"code": "580f1021"}], "as_of": {"height": 1, "time": 1795826000, "final": True}}
+
+    def test_the_five_counts(self):
+        self.assertEqual(collect.parse_roster(self.REAL),
+                         {"day": 20785, "accounts": 290, "keys": 310, "active_keys": 295, "active_accounts": 275})
+
+    def test_nothing_else_is_published(self):
+        self.assertEqual(sorted(collect.parse_roster(self.REAL)), ["accounts", "active_accounts", "active_keys", "day", "keys"])
+
+    def test_odd_or_missing_leaves_it_out(self):
+        for field in ("day", "accounts", "validators", "active", "active_accounts"):
+            for bad in (None, -1, 1.5, "310", True, [310]):
+                r = dict(self.REAL)
+                if bad is None:
+                    del r[field]
+                else:
+                    r[field] = bad
+                self.assertIsNone(collect.parse_roster(r), (field, bad))
+        for day in (0, 19000, 40000):
+            self.assertIsNone(collect.parse_roster(dict(self.REAL, day=day)))
+        for r in (None, [], "x", 3):
+            self.assertIsNone(collect.parse_roster(r))
+
+    def test_reads_the_route(self):
+        seen = []
+        def f(api, path, timeout=20):
+            seen.append((api, path, timeout))
+            return self.REAL
+        self.assertEqual(collect.chain_roster("http://127.0.0.1:1/api/v1", fetch=f)["keys"], 310)
+        self.assertEqual(seen, [("http://127.0.0.1:1/api/v1", "chain/roster", collect.ROSTER_TIMEOUT_S)])
+
+    def test_unreachable_or_older_node(self):
+        import urllib.error
+        for exc in (urllib.error.HTTPError("u", 404, "nf", {}, None), urllib.error.URLError("down"),
+                    OSError("x"), ValueError("not json")):
+            def f(api, path, timeout=20, exc=exc):
+                raise exc
+            self.assertIsNone(collect.chain_roster("http://127.0.0.1:1/api/v1", fetch=f))
+
+    def test_default_fetch_is_the_module_get(self):
+        real = collect.get
+        try:
+            collect.get = lambda api, path, timeout=20: self.REAL if path == "chain/roster" else None
+            self.assertEqual(collect.chain_roster("http://127.0.0.1:1/api/v1")["day"], 20785)
+        finally:
+            collect.get = real
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
